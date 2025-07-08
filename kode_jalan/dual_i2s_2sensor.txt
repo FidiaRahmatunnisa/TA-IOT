@@ -1,0 +1,98 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"
+#include "esp_timer.h"
+
+#define I2S_SAMPLE_RATE     (48000)
+#define I2S_SAMPLE_BITS     (32)
+#define I2S_DMA_BUF_LEN     (64)
+#define I2S_DMA_BUF_COUNT   (4)
+#define I2S_READ_LEN        (1024)
+
+#define I2S_NUM_0_MIC_WS    25
+#define I2S_NUM_0_MIC_SCK   26
+#define I2S_NUM_0_MIC_SD    22
+
+#define I2S_NUM_1_MIC_WS    27
+#define I2S_NUM_1_MIC_SCK   14
+#define I2S_NUM_1_MIC_SD    33
+
+void init_i2s(i2s_port_t port, int bck, int ws, int din) {
+    i2s_config_t config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = I2S_SAMPLE_RATE,
+        .bits_per_sample = I2S_SAMPLE_BITS,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = I2S_DMA_BUF_COUNT,
+        .dma_buf_len = I2S_DMA_BUF_LEN,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = bck,
+        .ws_io_num = ws,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = din,
+        .mck_io_num = I2S_PIN_NO_CHANGE  // WAJIB untuk hindari crash
+    };
+
+    i2s_driver_install(port, &config, 0, NULL);
+    i2s_set_pin(port, &pin_config);
+    i2s_zero_dma_buffer(port);
+}
+
+void app_main() {
+    // Inisialisasi I2S
+    init_i2s(I2S_NUM_0, I2S_NUM_0_MIC_SCK, I2S_NUM_0_MIC_WS, I2S_NUM_0_MIC_SD);
+    init_i2s(I2S_NUM_1, I2S_NUM_1_MIC_SCK, I2S_NUM_1_MIC_WS, I2S_NUM_1_MIC_SD);
+    printf("Dual I2S Siap!\n");
+
+    // Alokasi buffer di heap (bukan stack)
+    int32_t *mic0_buf = malloc(I2S_READ_LEN * sizeof(int32_t));
+    int32_t *mic1_buf = malloc(I2S_READ_LEN * sizeof(int32_t));
+    if (!mic0_buf || !mic1_buf) {
+        printf("Gagal alokasi buffer!\n");
+        return;
+    }
+
+    size_t bytes_read0, bytes_read1;
+
+    while (1) {
+        
+        // Baca mic 0
+        uint64_t t0 = esp_timer_get_time();
+        i2s_read(I2S_NUM_0, mic0_buf, I2S_READ_LEN * sizeof(int32_t), &bytes_read0, portMAX_DELAY);
+        uint64_t t1 = esp_timer_get_time();
+
+        // Baca mic 1
+        uint64_t t2 = esp_timer_get_time();
+        i2s_read(I2S_NUM_1, mic1_buf, I2S_READ_LEN * sizeof(int32_t), &bytes_read1, portMAX_DELAY);
+        uint64_t t3 = esp_timer_get_time();
+
+        // Hitung peak
+        int peak0 = 0, peak1 = 0;
+        for (int i = 0; i < I2S_READ_LEN; i++) {
+            int32_t amp0 = abs(mic0_buf[i] >> 14);
+            int32_t amp1 = abs(mic1_buf[i] >> 14);
+            if (amp0 > peak0) peak0 = amp0;
+            if (amp1 > peak1) peak1 = amp1;
+        }
+
+        // Output format yang diminta
+        printf("Mic0: Peak=%d, Time=%llu µs | Mic1: Peak=%d, Time=%llu µs\n",
+               peak0, t1, peak1, t3);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // Jika loop keluar (seharusnya tidak)
+    free(mic0_buf);
+    free(mic1_buf);
+}
