@@ -12,7 +12,8 @@ def main():
 
         with open(CSV_FILE, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['ts1', 'ts2', 'ts3', 'lokasi'])
+            # Kolom sudah dalam detik
+            writer.writerow(['ts1 (s)', 'ts2 (s)', 'ts3 (s)', 'lokasi'])
 
             print(f"[INFO] Logging ke {CSV_FILE}... Tekan Ctrl+C untuk berhenti.\n")
 
@@ -26,10 +27,16 @@ def main():
                     continue
 
                 try:
-                    ts1 = int(parts[0])
-                    ts2 = int(parts[2])
-                    ts3 = int(parts[4])
+                    ts1_us = int(parts[0])
+                    ts2_us = int(parts[2])
+                    ts3_us = int(parts[4])
 
+                    # Konversi ke detik (float)
+                    ts1 = ts1_us / 1_000_000
+                    ts2 = ts2_us / 1_000_000
+                    ts3 = ts3_us / 1_000_000
+
+                    # Tentukan lokasi
                     min_ts = min(ts1, ts2, ts3)
                     if min_ts == ts1:
                         lokasi = "Dekat Mic1"
@@ -38,9 +45,8 @@ def main():
                     else:
                         lokasi = "Dekat Mic3"
 
-                    # Hanya simpan ts1, ts2, ts3, lokasi
                     writer.writerow([ts1, ts2, ts3, lokasi])
-                    print(f"[DATA] ts1={ts1}, ts2={ts2}, ts3={ts3} --> {lokasi}")
+                    print(f"[DATA] ts1={ts1:.6f}, ts2={ts2:.6f}, ts3={ts3:.6f} --> {lokasi}")
 
                 except ValueError:
                     print(f"[WARNING] Gagal parsing: {line}")

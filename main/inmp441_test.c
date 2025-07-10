@@ -113,9 +113,28 @@ void monitor_task(void *arg) {
         //langsung tampil dimonitor
         // printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | ΔM1-M2: %lld µs | ΔM1-M3: %lld µs\n",
         //        peak1, ts1, peak2, ts2, peak3, ts3,(int64_t)(ts2 - ts1), (int64_t)(ts3 - ts1));
-        //untuk simpan kecsv
-        printf("%llu,%llu,%llu\n",
-       ts1, ts2, ts3);
+        
+         // Hitung selisih waktu
+        int64_t dt12 = (int64_t)(ts2 - ts1);
+        int64_t dt13 = (int64_t)(ts3 - ts1);
+
+        // Tentukan sensor terdekat berdasarkan timestamp terkecil
+        const char* prediksi_lokasi;
+        if (ts1 <= ts2 && ts1 <= ts3) {
+            prediksi_lokasi = "DEKAT MIC1";
+        } else if (ts2 <= ts1 && ts2 <= ts3) {
+            prediksi_lokasi = "DEKAT MIC2";
+        } else {
+            prediksi_lokasi = "DEKAT MIC3";
+        }
+
+        // Tampilkan hasil monitoring dan prediksi
+        printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | ΔM1-M2: %lld µs | ΔM1-M3: %lld µs | %s\n",
+               peak1, ts1, peak2, ts2, peak3, ts3, dt12, dt13, prediksi_lokasi);
+
+        // (Opsional) Simpan ke format CSV
+        // printf("%llu,%llu,%llu\n", ts1, ts2, ts3);
+
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
