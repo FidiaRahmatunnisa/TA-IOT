@@ -1,17 +1,31 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2s.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_http_client.h"
 #include "soc/gpio_sig_map.h"
 #include "hal/gpio_hal.h"
 
 // === Konfigurasi Umum ===
-#define SAMPLE_RATE     96000//48000
-#define I2S_READ_LEN    1024 //256
+#define SAMPLE_RATE     96000
+#define I2S_READ_LEN    256
+
+// === Konfigurasi WIFI ===
+#define WIFI_SSID       "HoYo"
+#define WIFI_PASS       "JaYONaEcelyo"
+
+// === Token Blynk ===
+#define BLYNK_TOKEN     "fFwjrznSFlQxXlagrI0IbkZgCmy1yIuj"
+#define SEND_THRESHOLD  500
 
 // === I2S Pin Mic1 / Mic3 (I2S_NUM_0) ===
 #define MIC13_WS        25
@@ -28,6 +42,7 @@ int32_t mic1_buf[I2S_READ_LEN], mic2_buf[I2S_READ_LEN], mic3_buf[I2S_READ_LEN];
 volatile int peak1 = 0, peak2 = 0, peak3 = 0;
 volatile uint64_t ts1 = 0, ts2 = 0, ts3 = 0;
 
+// === Init I2S ===
 void init_i2s(i2s_port_t port, int bck, int ws, int din) {
     i2s_config_t config = {
         .mode = I2S_MODE_MASTER | I2S_MODE_RX,
@@ -55,17 +70,63 @@ void init_i2s(i2s_port_t port, int bck, int ws, int din) {
     i2s_zero_dma_buffer(port);
 }
 
-// === Fungsi Switching GPIO Matrix Input ===
 void remap_i2s_input(int gpio_num) {
     gpio_set_direction(gpio_num, GPIO_MODE_INPUT);
     gpio_iomux_in(gpio_num, I2S0I_DATA_IN0_IDX);
 }
 
-// === Task Gabungan Mic1 dan Mic3 (via I2S0) ===
+void wifi_init() {
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
+    esp_wifi_start();
+    esp_wifi_connect();
+
+    ESP_LOGI("wifi", "Connecting to WiFi...");
+    vTaskDelay(5000 / portTICK_PERIOD_MS);  // Tunggu IP
+}
+
+void send_http_post(int p1, int p2, int p3, uint64_t t1, uint64_t t2, uint64_t t3) {
+    char url[512];
+    snprintf(url, sizeof(url),
+        "http://blynk.cloud/external/api/update?token=%s&V0=%d&V1=%llu&V2=%d&V3=%llu&V4=%d&V5=%llu",
+        BLYNK_TOKEN, p1, t1, p2, t2, p3, t3);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE("HTTP", "Failed to initialize client");
+        return;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        ESP_LOGI("HTTP", "✅ Data terkirim ke Blynk");
+    } else {
+        ESP_LOGE("HTTP", "❌ Gagal kirim ke Blynk: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+}
+
 void read_mic13_task(void *arg) {
     size_t bytes_read;
     while (1) {
-        // === Bacaan Mic1 ===
         remap_i2s_input(MIC1_SD);
         uint64_t t0_1 = esp_timer_get_time();
         i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
@@ -77,7 +138,6 @@ void read_mic13_task(void *arg) {
         peak1 = peak;
         ts1 = t0_1 + ((uint64_t)idx * 1000000ULL / SAMPLE_RATE);
 
-        // === Bacaan Mic3 ===
         remap_i2s_input(MIC3_SD);
         uint64_t t0_3 = esp_timer_get_time();
         i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
@@ -91,8 +151,7 @@ void read_mic13_task(void *arg) {
     }
 }
 
-// === Task Mic2 (via I2S1) ===
-void read_mic2_task(void *arg) {
+void read_mic2_and_post_task(void *arg) {
     size_t bytes_read;
     while (1) {
         uint64_t t0 = esp_timer_get_time();
@@ -104,27 +163,19 @@ void read_mic2_task(void *arg) {
         }
         peak2 = peak;
         ts2 = t0 + ((uint64_t)idx * 1000000ULL / SAMPLE_RATE);
-    }
-}
 
-// === Monitoring Task ===
-void monitor_task(void *arg) {
-    while (1) {
-        //langsung tampil dimonitor
-        // printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | ΔM1-M2: %lld µs | ΔM1-M3: %lld µs\n",
-        //        peak1, ts1, peak2, ts2, peak3, ts3,(int64_t)(ts2 - ts1), (int64_t)(ts3 - ts1));
-        //untuk simpan kecsv
-        printf("%llu,%llu,%llu\n",
-       ts1, ts2, ts3);
-        vTaskDelay(pdMS_TO_TICKS(300));
+        if (peak1 > SEND_THRESHOLD || peak2 > SEND_THRESHOLD || peak3 > SEND_THRESHOLD) {
+            send_http_post(peak1, peak2, peak3, ts1, ts2, ts3);
+        }
     }
 }
 
 void app_main() {
-    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);  // Akan diremap ke Mic3 juga
+    nvs_flash_init();
+    wifi_init();
+    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);
     init_i2s(I2S_NUM_1, MIC2_SCK, MIC2_WS, MIC2_SD);
 
-    xTaskCreatePinnedToCore(read_mic13_task, "mic13", 4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(read_mic2_task, "mic2", 4096, NULL, 1, NULL, 1);
-    xTaskCreate(monitor_task, "monitor", 4096, NULL, 1, NULL);
+    xTaskCreatePinnedToCore(read_mic13_task, "mic13", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(read_mic2_and_post_task, "mic2_post", 8192, NULL, 1, NULL, 0);
 }

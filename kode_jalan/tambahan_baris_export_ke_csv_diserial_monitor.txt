@@ -1,0 +1,12 @@
+// === Monitoring Task ===
+void monitor_task(void *arg) {
+    while (1) {
+        
+        //ubah printf nya jadi ini aja sih
+        printf("%llu,%d,%llu,%d,%llu,%d,%lld,%lld\n",
+       ts1, peak1, ts2, peak2, ts3, peak3,
+       (int64_t)(ts2 - ts1), (int64_t)(ts3 - ts1));
+
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}

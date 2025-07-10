@@ -10,8 +10,8 @@
 #include "hal/gpio_hal.h"
 
 // === Konfigurasi Umum ===
-#define SAMPLE_RATE     48000
-#define I2S_READ_LEN    1024
+#define SAMPLE_RATE     96000//48000
+#define I2S_READ_LEN    256//1024
 
 // === I2S Pin Mic1 / Mic3 (I2S_NUM_0) ===
 #define MIC13_WS        25
