@@ -12,8 +12,6 @@
 // === Konfigurasi Umum ===
 #define SAMPLE_RATE     96000
 #define I2S_READ_LEN    1024
-#define SPIKE_THRESHOLD 2000
-#define MAX_TIME_DIFF   2000  // µs
 
 // === I2S Pin Mic1 / Mic3 (I2S_NUM_0) ===
 #define MIC13_WS        25
@@ -60,6 +58,7 @@ float apply_fir(float sample, float* buf, int* idx) {
     return y;
 }
 
+// === I2S Setup ===
 void init_i2s(i2s_port_t port, int bck, int ws, int din) {
     i2s_config_t config = {
         .mode = I2S_MODE_MASTER | I2S_MODE_RX,
@@ -87,32 +86,38 @@ void init_i2s(i2s_port_t port, int bck, int ws, int din) {
     i2s_zero_dma_buffer(port);
 }
 
+// === GPIO Matrix Switching ===
 void remap_i2s_input(int gpio_num) {
     gpio_set_direction(gpio_num, GPIO_MODE_INPUT);
     gpio_iomux_in(gpio_num, I2S0I_DATA_IN0_IDX);
 }
 
+// === Task: Read Mic1 dan Mic3 ===
 void read_mic13_task(void *arg) {
     size_t bytes_read;
     while (1) {
+        // === Mic1 ===
         remap_i2s_input(MIC1_SD);
         uint64_t t0_1 = esp_timer_get_time();
         i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
         int peak = 0, idx = 0;
         for (int i = 0; i < I2S_READ_LEN; i++) {
-            float filtered = apply_fir((float)(mic1_buf[i] >> 14), fir_buf1, &fir_idx1);
+            float raw = (float)(mic1_buf[i] >> 14);
+            float filtered = apply_fir(raw, fir_buf1, &fir_idx1);
             int amp = fabs(filtered);
             if (amp > peak) { peak = amp; idx = i; }
         }
         peak1 = peak;
         ts1 = t0_1 + ((uint64_t)idx * 1000000ULL / SAMPLE_RATE);
 
+        // === Mic3 ===
         remap_i2s_input(MIC3_SD);
         uint64_t t0_3 = esp_timer_get_time();
         i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
         peak = 0; idx = 0;
         for (int i = 0; i < I2S_READ_LEN; i++) {
-            float filtered = apply_fir((float)(mic3_buf[i] >> 14), fir_buf3, &fir_idx3);
+            float raw = (float)(mic3_buf[i] >> 14);
+            float filtered = apply_fir(raw, fir_buf3, &fir_idx3);
             int amp = fabs(filtered);
             if (amp > peak) { peak = amp; idx = i; }
         }
@@ -121,6 +126,7 @@ void read_mic13_task(void *arg) {
     }
 }
 
+// === Task: Read Mic2 ===
 void read_mic2_task(void *arg) {
     size_t bytes_read;
     while (1) {
@@ -128,7 +134,8 @@ void read_mic2_task(void *arg) {
         i2s_read(I2S_NUM_1, mic2_buf, sizeof(mic2_buf), &bytes_read, portMAX_DELAY);
         int peak = 0, idx = 0;
         for (int i = 0; i < I2S_READ_LEN; i++) {
-            float filtered = apply_fir((float)(mic2_buf[i] >> 14), fir_buf2, &fir_idx2);
+            float raw = (float)(mic2_buf[i] >> 14);
+            float filtered = apply_fir(raw, fir_buf2, &fir_idx2);
             int amp = fabs(filtered);
             if (amp > peak) { peak = amp; idx = i; }
         }
@@ -137,27 +144,29 @@ void read_mic2_task(void *arg) {
     }
 }
 
+// === Task Monitoring + Prediksi Lokasi ===
 void monitor_task(void *arg) {
     while (1) {
-        int64_t dt12 = ts2 - ts1;
-        int64_t dt13 = ts3 - ts1;
+        int64_t dt12 = (int64_t)(ts2 - ts1);
+        int64_t dt13 = (int64_t)(ts3 - ts1);
 
-        const char* prediksi = "NO";
-        if (peak1 > SPIKE_THRESHOLD || peak2 > SPIKE_THRESHOLD || peak3 > SPIKE_THRESHOLD) {
-            if (abs(dt12) < MAX_TIME_DIFF && abs(dt13) < MAX_TIME_DIFF) {
-                if (ts1 <= ts2 && ts1 <= ts3) prediksi = "DEKAT MIC1";
-                else if (ts2 <= ts1 && ts2 <= ts3) prediksi = "DEKAT MIC2";
-                else prediksi = "DEKAT MIC3";
-            }
+        const char* prediksi_lokasi;
+        if (ts1 <= ts2 && ts1 <= ts3) {
+            prediksi_lokasi = "DEKAT MIC1";
+        } else if (ts2 <= ts1 && ts2 <= ts3) {
+            prediksi_lokasi = "DEKAT MIC2";
+        } else {
+            prediksi_lokasi = "DEKAT MIC3";
         }
 
-        printf("Mic1: %d | Mic2: %d | Mic3: %d | Δ12: %lld | Δ13: %lld | %s\n",
-               peak1, peak2, peak3, dt12, dt13, prediksi);
+        printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | ΔM1-M2: %lld µs | ΔM1-M3: %lld µs | %s\n",
+               peak1, ts1, peak2, ts2, peak3, ts3, dt12, dt13, prediksi_lokasi);
 
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
 
+// === MAIN ===
 void app_main() {
     init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);
     init_i2s(I2S_NUM_1, MIC2_SCK, MIC2_WS, MIC2_SD);
