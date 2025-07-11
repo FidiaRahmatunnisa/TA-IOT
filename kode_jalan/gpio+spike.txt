@@ -9,9 +9,9 @@
 #include "soc/gpio_sig_map.h"
 #include "hal/gpio_hal.h"
 
-// === Konfigurasi Umum ===
-#define SAMPLE_RATE     96000//48000
-#define I2S_READ_LEN    1024 //256
+#define SAMPLE_RATE     96000
+#define I2S_READ_LEN    1024
+#define SPIKE_THRESHOLD 2000
 
 // === I2S Pin Mic1 / Mic3 (I2S_NUM_0) ===
 #define MIC13_WS        25
@@ -55,17 +55,14 @@ void init_i2s(i2s_port_t port, int bck, int ws, int din) {
     i2s_zero_dma_buffer(port);
 }
 
-// === Fungsi Switching GPIO Matrix Input ===
 void remap_i2s_input(int gpio_num) {
     gpio_set_direction(gpio_num, GPIO_MODE_INPUT);
     gpio_iomux_in(gpio_num, I2S0I_DATA_IN0_IDX);
 }
 
-// === Task Gabungan Mic1 dan Mic3 (via I2S0) ===
 void read_mic13_task(void *arg) {
     size_t bytes_read;
     while (1) {
-        // === Bacaan Mic1 ===
         remap_i2s_input(MIC1_SD);
         uint64_t t0_1 = esp_timer_get_time();
         i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
@@ -77,7 +74,6 @@ void read_mic13_task(void *arg) {
         peak1 = peak;
         ts1 = t0_1 + ((uint64_t)idx * 1000000ULL / SAMPLE_RATE);
 
-        // === Bacaan Mic3 ===
         remap_i2s_input(MIC3_SD);
         uint64_t t0_3 = esp_timer_get_time();
         i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
@@ -91,7 +87,6 @@ void read_mic13_task(void *arg) {
     }
 }
 
-// === Task Mic2 (via I2S1) ===
 void read_mic2_task(void *arg) {
     size_t bytes_read;
     while (1) {
@@ -107,43 +102,41 @@ void read_mic2_task(void *arg) {
     }
 }
 
-// === Monitoring Task ===
 void monitor_task(void *arg) {
     while (1) {
-        //langsung tampil dimonitor
-        // printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | ΔM1-M2: %lld µs | ΔM1-M3: %lld µs\n",
-        //        peak1, ts1, peak2, ts2, peak3, ts3,(int64_t)(ts2 - ts1), (int64_t)(ts3 - ts1));
-        
-         // Hitung selisih waktu
-        // int64_t dt12 = (int64_t)(ts2 - ts1);
-        // int64_t dt13 = (int64_t)(ts3 - ts1);
+        // Cek apakah masing-masing mic mengalami spike
+        bool s1 = peak1 > SPIKE_THRESHOLD;
+        bool s2 = peak2 > SPIKE_THRESHOLD;
+        bool s3 = peak3 > SPIKE_THRESHOLD;
 
-        // Tentukan sensor terdekat berdasarkan timestamp terkecil
-        const char* prediksi_lokasi;
-        if (ts1 <= ts2 && ts1 <= ts3) {
-            prediksi_lokasi = "DEKAT MIC1";
-        } else if (ts2 <= ts1 && ts2 <= ts3) {
-            prediksi_lokasi = "DEKAT MIC2";
+        // Prediksi lokasi berdasarkan waktu terdahulu
+        const char* lokasi = "TIDAK DIKETAHUI";
+        uint64_t tmin = ts1;
+        lokasi = "DEKAT MIC1";
+
+        if (ts2 < tmin) { tmin = ts2; lokasi = "DEKAT MIC2"; }
+        if (ts3 < tmin) { tmin = ts3; lokasi = "DEKAT MIC3"; }
+
+        // Tampilkan data dan status spike
+        printf("Mic1: %d | Mic2: %d | Mic3: %d | Lokasi: %s | Status:", 
+               peak1, peak2, peak3, lokasi);
+
+        if (s1 || s2 || s3) {
+            if (s1) printf(" SPIKE1");
+            if (s2) printf(" SPIKE2");
+            if (s3) printf(" SPIKE3");
         } else {
-            prediksi_lokasi = "DEKAT MIC3";
+            printf(" NO");
         }
 
-        // Tampilkan hasil monitoring dan prediksi
-        // printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | %s\n",
-        //        peak1, ts1, peak2, ts2, peak3, ts3, prediksi_lokasi);
-
-        printf("Mic1: Peak=%d  | Mic2: Peak=%d  | Mic3: Peak=%d  | %s\n",
-                peak1, peak2, peak3, prediksi_lokasi);
-
-        // (Opsional) Simpan ke format CSV
-        // printf("%llu,%llu,%llu\n", ts1, ts2, ts3);
+        printf("\n");
 
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
 
 void app_main() {
-    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);  // Akan diremap ke Mic3 juga
+    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);
     init_i2s(I2S_NUM_1, MIC2_SCK, MIC2_WS, MIC2_SD);
 
     xTaskCreatePinnedToCore(read_mic13_task, "mic13", 4096, NULL, 1, NULL, 0);
