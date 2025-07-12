@@ -12,41 +12,27 @@ def main():
 
         with open(CSV_FILE, mode='w', newline='') as file:
             writer = csv.writer(file)
-            # Kolom sudah dalam detik
-            writer.writerow(['ts1 (s)', 'ts2 (s)', 'ts3 (s)', 'lokasi'])
+            writer.writerow(['waktu1 (s)', 'waktu2 (s)', 'waktu3 (s)', 'lokasi'])
 
             print(f"[INFO] Logging ke {CSV_FILE}... Tekan Ctrl+C untuk berhenti.\n")
 
             while True:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if not line:
-                    continue
+                if not line or line.startswith("Mic1"):
+                    continue  # Lewati log yang panjang, ambil hanya yang kita format khusus
 
                 parts = line.split(',')
-                if len(parts) != 8:
+                if len(parts) != 4:
                     continue
 
                 try:
-                    ts1_us = int(parts[0])
-                    ts2_us = int(parts[2])
-                    ts3_us = int(parts[4])
+                    waktu1 = int(parts[0]) / 1_000_000  # µs to s
+                    waktu2 = int(parts[1]) / 1_000_000
+                    waktu3 = int(parts[2]) / 1_000_000
+                    lokasi = parts[3].strip()
 
-                    # Konversi ke detik (float)
-                    ts1 = ts1_us / 1_000_000
-                    ts2 = ts2_us / 1_000_000
-                    ts3 = ts3_us / 1_000_000
-
-                    # Tentukan lokasi
-                    min_ts = min(ts1, ts2, ts3)
-                    if min_ts == ts1:
-                        lokasi = "Dekat Mic1"
-                    elif min_ts == ts2:
-                        lokasi = "Dekat Mic2"
-                    else:
-                        lokasi = "Dekat Mic3"
-
-                    writer.writerow([ts1, ts2, ts3, lokasi])
-                    print(f"[DATA] ts1={ts1:.6f}, ts2={ts2:.6f}, ts3={ts3:.6f} --> {lokasi}")
+                    writer.writerow([waktu1, waktu2, waktu3, lokasi])
+                    print(f"[DATA] {waktu1:.6f}, {waktu2:.6f}, {waktu3:.6f} --> {lokasi}")
 
                 except ValueError:
                     print(f"[WARNING] Gagal parsing: {line}")

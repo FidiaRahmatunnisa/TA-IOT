@@ -172,15 +172,11 @@ void monitor_task(void *arg) {
         uint64_t show2 = ts2_recorded ? ts2 : 0;
         uint64_t show3 = ts3_recorded ? ts3 : 0;
 
-        //tes sini
-        // printf("Mic1[Peak=%d, STE=%.1f, ZCR=%.2f, T=+%llu µs] | Mic2[Peak=%d, STE=%.1f, ZCR=%.2f, T=+%llu µs] | Mic3[Peak=%d, STE=%.1f, ZCR=%.2f, T=+%llu µs] => Lokasi: %s\n",
-        //     peak1, ste1, zcr1, show1,
-        //     peak2, ste2, zcr2, show2,
-        //     peak3, ste3, zcr3, show3,
-        //     lokasi);
-
-        //simpan ke csv 
-        printf("%llu,%llu,%llu,%s\n", show1, show2, show3, lokasi);
+        printf("Mic1[Peak=%d, STE=%.1f, ZCR=%.2f, T=+%llu µs] | Mic2[Peak=%d, STE=%.1f, ZCR=%.2f, T=+%llu µs] | Mic3[Peak=%d, STE=%.1f, ZCR=%.2f, T=+%llu µs] => Lokasi: %s\n",
+            peak1, ste1, zcr1, show1,
+            peak2, ste2, zcr2, show2,
+            peak3, ste3, zcr3, show3,
+            lokasi);
 
         if (peak1 < THRESHOLD1 && peak2 < THRESHOLD2 && peak3 < THRESHOLD3) {
             silent_counter++;
