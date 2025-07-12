@@ -10,8 +10,8 @@
 #include "hal/gpio_hal.h"
 
 // === Konfigurasi Umum ===
-#define SAMPLE_RATE     96000//48000
-#define I2S_READ_LEN    1024 //256
+#define SAMPLE_RATE     96000
+#define I2S_READ_LEN    1024
 
 // === I2S Pin Mic1 / Mic3 (I2S_NUM_0) ===
 #define MIC13_WS        25
@@ -64,30 +64,62 @@ void remap_i2s_input(int gpio_num) {
 // === Task Gabungan Mic1 dan Mic3 (via I2S0) ===
 void read_mic13_task(void *arg) {
     size_t bytes_read;
-    while (1) {
-        // === Bacaan Mic1 ===
-        remap_i2s_input(MIC1_SD);
-        uint64_t t0_1 = esp_timer_get_time();
-        i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
-        int peak = 0, idx = 0;
-        for (int i = 0; i < I2S_READ_LEN; i++) {
-            int amp = abs(mic1_buf[i] >> 14);
-            if (amp > peak) { peak = amp; idx = i; }
-        }
-        peak1 = peak;
-        ts1 = t0_1 + ((uint64_t)idx * 1000000ULL / SAMPLE_RATE);
+    bool baca_mic1_dulu = true;
 
-        // === Bacaan Mic3 ===
-        remap_i2s_input(MIC3_SD);
-        uint64_t t0_3 = esp_timer_get_time();
-        i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
-        peak = 0; idx = 0;
-        for (int i = 0; i < I2S_READ_LEN; i++) {
-            int amp = abs(mic3_buf[i] >> 14);
-            if (amp > peak) { peak = amp; idx = i; }
+    while (1) {
+        int peak = 0, idx = 0;
+
+        if (baca_mic1_dulu) {
+            // === Mic1 ===
+            remap_i2s_input(MIC1_SD);
+            i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
+            uint64_t t1 = esp_timer_get_time();
+            peak = 0, idx = 0;
+            for (int i = 0; i < I2S_READ_LEN; i++) {
+                int amp = abs(mic1_buf[i] >> 14);
+                if (amp > peak) { peak = amp; idx = i; }
+            }
+            peak1 = peak;
+            ts1 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+
+            // === Mic3 ===
+            remap_i2s_input(MIC3_SD);
+            i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
+            t1 = esp_timer_get_time();
+            peak = 0, idx = 0;
+            for (int i = 0; i < I2S_READ_LEN; i++) {
+                int amp = abs(mic3_buf[i] >> 14);
+                if (amp > peak) { peak = amp; idx = i; }
+            }
+            peak3 = peak;
+            ts3 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+        } else {
+            // === Mic3 ===
+            remap_i2s_input(MIC3_SD);
+            i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
+            uint64_t t1 = esp_timer_get_time();
+            peak = 0, idx = 0;
+            for (int i = 0; i < I2S_READ_LEN; i++) {
+                int amp = abs(mic3_buf[i] >> 14);
+                if (amp > peak) { peak = amp; idx = i; }
+            }
+            peak3 = peak;
+            ts3 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+
+            // === Mic1 ===
+            remap_i2s_input(MIC1_SD);
+            i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
+            t1 = esp_timer_get_time();
+            peak = 0, idx = 0;
+            for (int i = 0; i < I2S_READ_LEN; i++) {
+                int amp = abs(mic1_buf[i] >> 14);
+                if (amp > peak) { peak = amp; idx = i; }
+            }
+            peak1 = peak;
+            ts1 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
         }
-        peak3 = peak;
-        ts3 = t0_3 + ((uint64_t)idx * 1000000ULL / SAMPLE_RATE);
+
+        baca_mic1_dulu = !baca_mic1_dulu;
     }
 }
 
@@ -95,30 +127,22 @@ void read_mic13_task(void *arg) {
 void read_mic2_task(void *arg) {
     size_t bytes_read;
     while (1) {
-        uint64_t t0 = esp_timer_get_time();
         i2s_read(I2S_NUM_1, mic2_buf, sizeof(mic2_buf), &bytes_read, portMAX_DELAY);
+        uint64_t t1 = esp_timer_get_time();
         int peak = 0, idx = 0;
         for (int i = 0; i < I2S_READ_LEN; i++) {
             int amp = abs(mic2_buf[i] >> 14);
             if (amp > peak) { peak = amp; idx = i; }
         }
         peak2 = peak;
-        ts2 = t0 + ((uint64_t)idx * 1000000ULL / SAMPLE_RATE);
+        ts2 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
     }
 }
 
 // === Monitoring Task ===
 void monitor_task(void *arg) {
     while (1) {
-        //langsung tampil dimonitor
-        // printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | ΔM1-M2: %lld µs | ΔM1-M3: %lld µs\n",
-        //        peak1, ts1, peak2, ts2, peak3, ts3,(int64_t)(ts2 - ts1), (int64_t)(ts3 - ts1));
-        
-         // Hitung selisih waktu
-        // int64_t dt12 = (int64_t)(ts2 - ts1);
-        // int64_t dt13 = (int64_t)(ts3 - ts1);
 
-        // Tentukan sensor terdekat berdasarkan timestamp terkecil
         const char* prediksi_lokasi;
         if (ts1 <= ts2 && ts1 <= ts3) {
             prediksi_lokasi = "DEKAT MIC1";
@@ -128,22 +152,15 @@ void monitor_task(void *arg) {
             prediksi_lokasi = "DEKAT MIC3";
         }
 
-        // Tampilkan hasil monitoring dan prediksi
-        // printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | %s\n",
-        //        peak1, ts1, peak2, ts2, peak3, ts3, prediksi_lokasi);
-
-        printf("Mic1: Peak=%d  | Mic2: Peak=%d  | Mic3: Peak=%d  | %s\n",
-                peak1, peak2, peak3, prediksi_lokasi);
-
-        // (Opsional) Simpan ke format CSV
-        // printf("%llu,%llu,%llu\n", ts1, ts2, ts3);
+        printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | %s\n",
+               peak1, ts1, peak2, ts2, peak3, ts3, prediksi_lokasi);
 
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
 
 void app_main() {
-    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);  // Akan diremap ke Mic3 juga
+    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);  // akan diremap ke Mic3 juga
     init_i2s(I2S_NUM_1, MIC2_SCK, MIC2_WS, MIC2_SD);
 
     xTaskCreatePinnedToCore(read_mic13_task, "mic13", 4096, NULL, 1, NULL, 0);
