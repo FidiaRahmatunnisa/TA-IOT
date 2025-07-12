@@ -13,6 +13,13 @@
 #define SAMPLE_RATE     96000
 #define I2S_READ_LEN    1024
 
+// === Threshold Per Mikrofon ===
+#define THRESHOLD1      300  // Mic1
+#define THRESHOLD2      240  // Mic2
+#define THRESHOLD3      300  // Mic3
+
+#define SILENT_LIMIT    3
+
 // === I2S Pin Mic1 / Mic3 (I2S_NUM_0) ===
 #define MIC13_WS        25
 #define MIC13_SCK       26
@@ -24,10 +31,16 @@
 #define MIC2_SCK        14
 #define MIC2_SD         33
 
+// === Variabel Global ===
 int32_t mic1_buf[I2S_READ_LEN], mic2_buf[I2S_READ_LEN], mic3_buf[I2S_READ_LEN];
 volatile int peak1 = 0, peak2 = 0, peak3 = 0;
 volatile uint64_t ts1 = 0, ts2 = 0, ts3 = 0;
+volatile uint64_t base_time = 0;
+volatile bool event_started = false;
+volatile bool ts1_recorded = false, ts2_recorded = false, ts3_recorded = false;
+int silent_counter = 0;
 
+// === Inisialisasi I2S ===
 void init_i2s(i2s_port_t port, int bck, int ws, int din) {
     i2s_config_t config = {
         .mode = I2S_MODE_MASTER | I2S_MODE_RX,
@@ -55,112 +68,116 @@ void init_i2s(i2s_port_t port, int bck, int ws, int din) {
     i2s_zero_dma_buffer(port);
 }
 
-// === Fungsi Switching GPIO Matrix Input ===
+// === Remap Input I2S0 ===
 void remap_i2s_input(int gpio_num) {
     gpio_set_direction(gpio_num, GPIO_MODE_INPUT);
     gpio_iomux_in(gpio_num, I2S0I_DATA_IN0_IDX);
 }
 
-// === Task Gabungan Mic1 dan Mic3 (via I2S0) ===
-void read_mic13_task(void *arg) {
-    size_t bytes_read;
-    bool baca_mic1_dulu = true;
+// === Proses Sinyal & Timestamp ===
+void process_signal(int32_t *buf, int *peak, uint64_t *ts, bool *recorded, uint64_t base_time, int threshold) {
+    int max = 0, idx = 0;
+    for (int i = 0; i < I2S_READ_LEN; i++) {
+        int amp = abs(buf[i] >> 14);
+        if (amp > max) { max = amp; idx = i; }
+    }
 
-    while (1) {
-        int peak = 0, idx = 0;
+    *peak = max;
 
-        if (baca_mic1_dulu) {
-            // === Mic1 ===
-            remap_i2s_input(MIC1_SD);
-            i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
-            uint64_t t1 = esp_timer_get_time();
-            peak = 0, idx = 0;
-            for (int i = 0; i < I2S_READ_LEN; i++) {
-                int amp = abs(mic1_buf[i] >> 14);
-                if (amp > peak) { peak = amp; idx = i; }
-            }
-            peak1 = peak;
-            ts1 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+    uint64_t t_now = esp_timer_get_time();
+    uint64_t t_arrival = t_now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
 
-            // === Mic3 ===
-            remap_i2s_input(MIC3_SD);
-            i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
-            t1 = esp_timer_get_time();
-            peak = 0, idx = 0;
-            for (int i = 0; i < I2S_READ_LEN; i++) {
-                int amp = abs(mic3_buf[i] >> 14);
-                if (amp > peak) { peak = amp; idx = i; }
-            }
-            peak3 = peak;
-            ts3 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
-        } else {
-            // === Mic3 ===
-            remap_i2s_input(MIC3_SD);
-            i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
-            uint64_t t1 = esp_timer_get_time();
-            peak = 0, idx = 0;
-            for (int i = 0; i < I2S_READ_LEN; i++) {
-                int amp = abs(mic3_buf[i] >> 14);
-                if (amp > peak) { peak = amp; idx = i; }
-            }
-            peak3 = peak;
-            ts3 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
-
-            // === Mic1 ===
-            remap_i2s_input(MIC1_SD);
-            i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
-            t1 = esp_timer_get_time();
-            peak = 0, idx = 0;
-            for (int i = 0; i < I2S_READ_LEN; i++) {
-                int amp = abs(mic1_buf[i] >> 14);
-                if (amp > peak) { peak = amp; idx = i; }
-            }
-            peak1 = peak;
-            ts1 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
-        }
-
-        baca_mic1_dulu = !baca_mic1_dulu;
+    if (!(*recorded) && max > threshold && base_time > 0 && t_arrival >= base_time) {
+        *ts = t_arrival - base_time;
+        *recorded = true;
     }
 }
 
-// === Task Mic2 (via I2S1) ===
+// === Task Baca Mic1 & Mic3 ===
+void read_mic13_task(void *arg) {
+    size_t bytes_read;
+    bool baca_mic1 = true;
+
+    while (1) {
+        if (baca_mic1) {
+            remap_i2s_input(MIC1_SD);
+            i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
+            process_signal(mic1_buf, &peak1, &ts1, &ts1_recorded, base_time, THRESHOLD1);
+
+            remap_i2s_input(MIC3_SD);
+            i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
+            process_signal(mic3_buf, &peak3, &ts3, &ts3_recorded, base_time, THRESHOLD3);
+        } else {
+            remap_i2s_input(MIC3_SD);
+            i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
+            process_signal(mic3_buf, &peak3, &ts3, &ts3_recorded, base_time, THRESHOLD3);
+
+            remap_i2s_input(MIC1_SD);
+            i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
+            process_signal(mic1_buf, &peak1, &ts1, &ts1_recorded, base_time, THRESHOLD1);
+        }
+
+        baca_mic1 = !baca_mic1;
+    }
+}
+
+// === Task Baca Mic2 ===
 void read_mic2_task(void *arg) {
     size_t bytes_read;
     while (1) {
         i2s_read(I2S_NUM_1, mic2_buf, sizeof(mic2_buf), &bytes_read, portMAX_DELAY);
-        uint64_t t1 = esp_timer_get_time();
-        int peak = 0, idx = 0;
-        for (int i = 0; i < I2S_READ_LEN; i++) {
-            int amp = abs(mic2_buf[i] >> 14);
-            if (amp > peak) { peak = amp; idx = i; }
-        }
-        peak2 = peak;
-        ts2 = t1 - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+        process_signal(mic2_buf, &peak2, &ts2, &ts2_recorded, base_time, THRESHOLD2);
     }
 }
 
-// === Monitoring Task ===
+// === Task Monitor dan Deteksi Lokasi ===
 void monitor_task(void *arg) {
     while (1) {
-
-        const char* prediksi_lokasi;
-        if (ts1 <= ts2 && ts1 <= ts3) {
-            prediksi_lokasi = "DEKAT MIC1";
-        } else if (ts2 <= ts1 && ts2 <= ts3) {
-            prediksi_lokasi = "DEKAT MIC2";
-        } else {
-            prediksi_lokasi = "DEKAT MIC3";
+        // Deteksi awal suara
+        if (!event_started &&
+            (peak1 > THRESHOLD1 || peak2 > THRESHOLD2 || peak3 > THRESHOLD3)) {
+            base_time = esp_timer_get_time();
+            ts1 = ts2 = ts3 = 0;
+            ts1_recorded = ts2_recorded = ts3_recorded = false;
+            event_started = true;
         }
 
-        printf("Mic1: Peak=%d @ %llu µs | Mic2: Peak=%d @ %llu µs | Mic3: Peak=%d @ %llu µs | %s\n",
-               peak1, ts1, peak2, ts2, peak3, ts3, prediksi_lokasi);
+        // Prediksi lokasi berdasarkan timestamp terkecil
+        const char *lokasi = "BELUM TERDETEKSI";
+        if (ts1 > 0 || ts2 > 0 || ts3 > 0) {
+            if (ts1 <= ts2 && ts1 <= ts3 && ts1 > 0) lokasi = "DEKAT MIC1";
+            else if (ts2 <= ts1 && ts2 <= ts3 && ts2 > 0) lokasi = "DEKAT MIC2";
+            else if (ts3 <= ts1 && ts3 <= ts2 && ts3 > 0) lokasi = "DEKAT MIC3";
+        }
+
+        uint64_t show1 = ts1_recorded ? ts1 : 0;
+        uint64_t show2 = ts2_recorded ? ts2 : 0;
+        uint64_t show3 = ts3_recorded ? ts3 : 0;
+
+        printf("Mic1: Peak=%d @ +%llu µs | Mic2: Peak=%d @ +%llu µs | Mic3: Peak=%d @ +%llu µs | %s\n",
+               peak1, show1, peak2, show2, peak3, show3, lokasi);
+
+        // Reset jika tidak ada suara besar dalam beberapa siklus
+        if (peak1 < THRESHOLD1 && peak2 < THRESHOLD2 && peak3 < THRESHOLD3) {
+            silent_counter++;
+            if (silent_counter >= SILENT_LIMIT) {
+                base_time = 0;
+                ts1 = ts2 = ts3 = 0;
+                ts1_recorded = ts2_recorded = ts3_recorded = false;
+                event_started = false;
+                silent_counter = 0;
+            }
+        } else {
+            silent_counter = 0;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
 
+// === Fungsi Utama ===
 void app_main() {
-    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);  // akan diremap ke Mic3 juga
+    init_i2s(I2S_NUM_0, MIC13_SCK, MIC13_WS, MIC1_SD);
     init_i2s(I2S_NUM_1, MIC2_SCK, MIC2_WS, MIC2_SD);
 
     xTaskCreatePinnedToCore(read_mic13_task, "mic13", 4096, NULL, 1, NULL, 0);
