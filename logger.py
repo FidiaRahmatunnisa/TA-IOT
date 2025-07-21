@@ -1,4 +1,3 @@
-import os
 import serial
 import csv
 
@@ -8,12 +7,7 @@ CSV_FILE = 'data_log.csv'
 
 def main():
     try:
-        # Hapus file lama jika ada
-        if os.path.exists(CSV_FILE):
-            os.remove(CSV_FILE)
-            print(f"[INFO] File lama '{CSV_FILE}' dihapus.")
-
-        ser = serial.Serial(PORT, BAUD_RATE, timeout=1)
+        ser = serial.Serial(PORT, BAUD_RATE, timeout=0.2)
         print(f"[INFO] Membuka port {PORT}...")
 
         with open(CSV_FILE, mode='w', newline='') as file:
@@ -22,29 +16,23 @@ def main():
 
             print(f"[INFO] Logging ke {CSV_FILE}... Tekan Ctrl+C untuk berhenti.\n")
 
-            last_entry = None
-
             while True:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if not line or line.startswith("Mic1"):
-                    continue
+                    continue  # Lewati log yang panjang, ambil hanya yang kita format khusus
 
                 parts = line.split(',')
                 if len(parts) != 4:
                     continue
 
                 try:
-                    ts1 = int(parts[0]) / 1_000_000
-                    ts2 = int(parts[1]) / 1_000_000
-                    ts3 = int(parts[2]) / 1_000_000
+                    waktu1 = int(parts[0]) / 1_000_000  # µs to s
+                    waktu2 = int(parts[1]) / 1_000_000
+                    waktu3 = int(parts[2]) / 1_000_000
                     lokasi = parts[3].strip()
 
-                    current_entry = (round(ts1, 6), round(ts2, 6), round(ts3, 6), lokasi)
-
-                    if current_entry != last_entry:
-                        writer.writerow(current_entry)
-                        print(f"[DATA] {current_entry}")
-                        last_entry = current_entry
+                    writer.writerow([waktu1, waktu2, waktu3, lokasi])
+                    print(f"[DATA] {waktu1:.6f}, {waktu2:.6f}, {waktu3:.6f} --> {lokasi}")
 
                 except ValueError:
                     print(f"[WARNING] Gagal parsing: {line}")
