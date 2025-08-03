@@ -1,0 +1,190 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"
+#include "driver/uart.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+// === Konfigurasi Umum ===
+#define SAMPLE_RATE     96000
+#define I2S_READ_LEN    1024
+#define THRESHOLD3      100
+#define STE_THRESHOLD   200000.0f
+#define ZCR_THRESHOLD   0.2f
+
+// === I2S Pin Mic3 ===
+#define MIC3_SCK        26  // BCK
+#define MIC3_WS         25  // LRCK
+#define MIC3_SD         22  // DATA
+
+// === UART (ESP2 → ESP1) ===
+#define UART_PORT_NUM   UART_NUM_1
+#define UART_TXD        17  // TX ESP2 → RX ESP1
+#define UART_RXD        16  // RX ESP2 ← TX ESP1 (optional)
+#define UART_BUF_SIZE   1024
+
+// === Buffer & Variabel Deteksi ===
+int32_t mic3_buf[I2S_READ_LEN];
+float ste3 = 0, zcr3 = 0;
+int peak3 = 0;
+volatile bool event_started = false;
+volatile bool ts3_sent = false;
+volatile uint64_t rel_time_us = 0;
+
+//sinkronisasi timer esp1-esp2
+volatile uint64_t base_time_esp2 = 0;
+volatile bool synced_with_master = false;
+
+// === Inisialisasi I2S untuk Mic3 ===
+void init_i2s_mic3() {
+    i2s_config_t config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+    i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = MIC3_SCK,
+        .ws_io_num = MIC3_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = MIC3_SD,
+        .mck_io_num = I2S_PIN_NO_CHANGE
+    };
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+// === Inisialisasi UART ===
+void init_uart() {
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE, 0, 0, NULL, 0);
+    uart_param_config(UART_PORT_NUM, &uart_config);
+    uart_set_pin(UART_PORT_NUM, UART_TXD, UART_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+void wait_for_start_signal(void *arg) {
+    uint8_t data[64];
+    while (1) {
+        int len = uart_read_bytes(UART_PORT_NUM, data, sizeof(data) - 1, 100 / portTICK_PERIOD_MS);
+        if (len > 0) {
+            data[len] = '\0';
+            if (strstr((char*)data, "START")) {
+                base_time_esp2 = esp_timer_get_time();
+                synced_with_master = true;
+                printf("🚀 START diterima, base_time diset: %llu µs\n", base_time_esp2);
+                break;
+            } else {
+                printf("⏳ Menunggu sinyal START, diterima: %s\n", data);
+            }
+        } else {
+            printf("🕒 Tidak ada data masuk dari UART\n");
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+
+// === Hitung STE dan ZCR ===
+void compute_ste_zcr(int32_t *buf, float *ste_out, float *zcr_out) {
+    float ste = 0;
+    int zcr = 0;
+    int last_sign = 0;
+    for (int i = 0; i < I2S_READ_LEN; i++) {
+        int16_t sample = buf[i] >> 14;
+        ste += sample * sample;
+        int sign = (sample >= 0) ? 1 : -1;
+        if (i > 0 && sign != last_sign) zcr++;
+        last_sign = sign;
+    }
+    *ste_out = ste / I2S_READ_LEN;
+    *zcr_out = (float)zcr / I2S_READ_LEN;
+}
+
+// === Task Mic3 ===
+void mic3_task(void *arg) {
+    ESP_LOGI("mic3_task", "Task dimulai!");
+
+    size_t bytes_read;
+    while (1) {
+        if (!synced_with_master) {
+         vTaskDelay(pdMS_TO_TICKS(10));
+         continue;
+        }
+        i2s_read(I2S_NUM_0, mic3_buf, sizeof(mic3_buf), &bytes_read, portMAX_DELAY);
+        compute_ste_zcr(mic3_buf, &ste3, &zcr3);
+
+        int max = 0, idx = 0;
+        for (int i = 0; i < I2S_READ_LEN; i++) {
+            int amp = abs(mic3_buf[i] >> 14);
+            if (amp > max) { max = amp; idx = i; }
+        }
+        peak3 = max;
+
+        if (!event_started &&
+            peak3 > THRESHOLD3 &&
+            ste3 > STE_THRESHOLD &&
+            zcr3 < ZCR_THRESHOLD) {
+
+            event_started = true;
+            ts3_sent = false;
+            rel_time_us = 0;
+        }
+
+        if (event_started && !ts3_sent &&
+            peak3 > THRESHOLD3 &&
+            ste3 > STE_THRESHOLD &&
+            zcr3 < ZCR_THRESHOLD) {
+
+            uint64_t t_us = (idx * 1000000ULL) / SAMPLE_RATE;
+            uint64_t now = esp_timer_get_time();
+            uint64_t ts3 = (now - base_time_esp2) + t_us;
+            // uint64_t ts3 = rel_time_us + t_us;
+
+            char buffer[64];
+            snprintf(buffer, sizeof(buffer), "M3:%06llu\n", ts3);
+            uart_write_bytes(UART_PORT_NUM, buffer, strlen(buffer));
+            printf("Terkirim: %s", buffer);
+
+            ts3_sent = true;
+            event_started = false;
+            rel_time_us = 0;
+
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// === Main Aplikasi ===
+void test_esp2() {
+    init_i2s_mic3();
+    init_uart();
+
+    // ⏳ Tunggu sinyal sinkronisasi dari ESP1 sebelum lanjut
+    xTaskCreate(wait_for_start_signal, "sync_wait", 2048, NULL, 2, NULL);
+
+    // Task deteksi suara mic3 tetap dibuat, tidak masalah jika aktif duluan
+    xTaskCreatePinnedToCore(mic3_task, "mic3", 4096, NULL, 1, NULL, 1);
+}
+

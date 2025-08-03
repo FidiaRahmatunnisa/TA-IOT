@@ -1,0 +1,148 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"
+#include "driver/uart.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+
+#define SAMPLE_RATE     96000
+#define I2S_READ_LEN    1024
+#define THRESHOLD       100
+#define STE_THRESHOLD   200000.0f
+#define ZCR_THRESHOLD   0.2f
+#define SILENT_LIMIT    3
+
+// Pin Mic2 (di ESP kedua)
+#define MIC_SCK         26
+#define MIC_WS          25
+#define MIC_SD          22
+
+// UART ke ESP1
+#define UART_TXD        17
+#define UART_RXD        16
+
+int32_t mic_buf[I2S_READ_LEN];
+float ste = 0, zcr = 0;
+volatile int peak = 0;
+volatile uint64_t ts = 0;
+volatile bool ts_sent = false;
+volatile uint64_t base_time = 0;
+int silent_counter = 0;
+
+void init_i2s() {
+    i2s_config_t config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+    i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = MIC_SCK,
+        .ws_io_num = MIC_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = MIC_SD,
+        .mck_io_num = I2S_PIN_NO_CHANGE
+    };
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+void init_uart() {
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_driver_install(UART_NUM_1, 1024, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, UART_TXD, UART_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+void compute_ste_zcr(int32_t *buf, float *ste_out, float *zcr_out) {
+    float ste_val = 0;
+    int zcr_count = 0;
+    int last_sign = 0;
+
+    for (int i = 0; i < I2S_READ_LEN; i++) {
+        int16_t sample = buf[i] >> 14;
+        ste_val += sample * sample;
+
+        int sign = (sample >= 0) ? 1 : -1;
+        if (i > 0 && sign != last_sign) zcr_count++;
+        last_sign = sign;
+    }
+
+    *ste_out = ste_val / I2S_READ_LEN;
+    *zcr_out = (float)zcr_count / I2S_READ_LEN;
+}
+
+void mic_task(void *arg) {
+    size_t bytes_read;
+    while (1) {
+        i2s_read(I2S_NUM_0, mic_buf, sizeof(mic_buf), &bytes_read, portMAX_DELAY);
+        compute_ste_zcr(mic_buf, &ste, &zcr);
+
+        int max_amp = 0, max_idx = 0;
+        for (int i = 0; i < I2S_READ_LEN; i++) {
+            int amp = abs(mic_buf[i] >> 14);
+            if (amp > max_amp) {
+                max_amp = amp;
+                max_idx = i;
+            }
+        }
+        peak = max_amp;
+
+        uint64_t now = esp_timer_get_time();
+        uint64_t t_arrival = now - ((I2S_READ_LEN - max_idx) * 1000000ULL / SAMPLE_RATE);
+
+        if (base_time == 0 && peak > THRESHOLD && ste > STE_THRESHOLD && zcr < ZCR_THRESHOLD) {
+            base_time = t_arrival;
+        }
+
+        if (!ts_sent && base_time > 0 && peak > THRESHOLD && ste > STE_THRESHOLD && zcr < ZCR_THRESHOLD) {
+            ts = t_arrival - base_time;
+            ts_sent = true;
+
+            char buffer[64];
+            snprintf(buffer, sizeof(buffer), "M2:%llu\n", ts);  // ESP1 akan mengenali ini sebagai M2
+            uart_write_bytes(UART_NUM_1, buffer, strlen(buffer));
+            printf("Terkirim: %s", buffer);
+        }
+
+        // Reset base time jika sunyi cukup lama
+        if (peak < THRESHOLD) {
+            silent_counter++;
+            if (silent_counter >= SILENT_LIMIT) {
+                base_time = 0;
+                ts = 0;
+                ts_sent = false;
+                silent_counter = 0;
+            }
+        } else {
+            silent_counter = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void app_main() {
+    init_i2s();
+    init_uart();
+    xTaskCreatePinnedToCore(mic_task, "mic_task", 4096, NULL, 1, NULL, 1);
+}

@@ -1,0 +1,173 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"
+#include "driver/uart.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+
+// ===== Konfigurasi Umum =====
+#define SAMPLE_RATE     96000
+#define I2S_READ_LEN    1024
+#define THRESHOLD       100
+#define STE_THRESHOLD   200000.0f
+#define ZCR_THRESHOLD   0.2f
+
+// ===== Pin I2S Mic1 (I2S_NUM_0) =====
+#define MIC1_SCK        26
+#define MIC1_WS         25
+#define MIC1_SD         22
+
+// ===== Pin I2S Mic2 (I2S_NUM_1) =====
+#define MIC2_SCK        14
+#define MIC2_WS         27
+#define MIC2_SD         33
+
+// ===== UART dari ESP2 (Mic3) =====
+#define UART_RX         16
+#define UART_TX         -1  // Tidak digunakan
+
+int32_t mic1_buf[I2S_READ_LEN], mic2_buf[I2S_READ_LEN];
+float ste1 = 0, ste2 = 0, zcr1 = 0, zcr2 = 0;
+int peak1 = 0, peak2 = 0;
+volatile uint64_t ts1 = 0, ts2 = 0, ts3 = 0;
+volatile bool ts1_sent = false, ts2_sent = false;
+
+void init_i2s(i2s_port_t port, int bck, int ws, int din) {
+    i2s_config_t config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+    i2s_driver_install(port, &config, 0, NULL);
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = bck,
+        .ws_io_num = ws,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = din,
+        .mck_io_num = I2S_PIN_NO_CHANGE
+    };
+    i2s_set_pin(port, &pin_config);
+    i2s_zero_dma_buffer(port);
+}
+
+void init_uart() {
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_driver_install(UART_NUM_1, 1024, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, UART_TX, UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+void compute_ste_zcr(int32_t *buf, float *ste_out, float *zcr_out) {
+    float ste = 0;
+    int zcr = 0;
+    int last_sign = 0;
+    for (int i = 0; i < I2S_READ_LEN; i++) {
+        int16_t sample = buf[i] >> 14;
+        ste += sample * sample;
+        int sign = (sample >= 0) ? 1 : -1;
+        if (i > 0 && sign != last_sign) zcr++;
+        last_sign = sign;
+    }
+    *ste_out = ste / I2S_READ_LEN;
+    *zcr_out = (float)zcr / I2S_READ_LEN;
+}
+
+void mic1_task(void *arg) {
+    size_t bytes_read;
+    while (1) {
+        i2s_read(I2S_NUM_0, mic1_buf, sizeof(mic1_buf), &bytes_read, portMAX_DELAY);
+        compute_ste_zcr(mic1_buf, &ste1, &zcr1);
+
+        int max = 0, idx = 0;
+        for (int i = 0; i < I2S_READ_LEN; i++) {
+            int amp = abs(mic1_buf[i] >> 14);
+            if (amp > max) { max = amp; idx = i; }
+        }
+        peak1 = max;
+
+        if (!ts1_sent && peak1 > THRESHOLD && ste1 > STE_THRESHOLD && zcr1 < ZCR_THRESHOLD) {
+            ts1 = (idx * 1000000ULL) / SAMPLE_RATE;
+            ts1_sent = true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void mic2_task(void *arg) {
+    size_t bytes_read;
+    while (1) {
+        i2s_read(I2S_NUM_1, mic2_buf, sizeof(mic2_buf), &bytes_read, portMAX_DELAY);
+        compute_ste_zcr(mic2_buf, &ste2, &zcr2);
+
+        int max = 0, idx = 0;
+        for (int i = 0; i < I2S_READ_LEN; i++) {
+            int amp = abs(mic2_buf[i] >> 14);
+            if (amp > max) { max = amp; idx = i; }
+        }
+        peak2 = max;
+
+        if (!ts2_sent && peak2 > THRESHOLD && ste2 > STE_THRESHOLD && zcr2 < ZCR_THRESHOLD) {
+            ts2 = (idx * 1000000ULL) / SAMPLE_RATE;
+            ts2_sent = true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void uart_receive_task(void *arg) {
+    uint8_t data[64];
+    while (1) {
+        int len = uart_read_bytes(UART_NUM_1, data, sizeof(data)-1, pdMS_TO_TICKS(10));
+        if (len > 0) {
+            data[len] = '\0';
+            if (strncmp((char *)data, "M3:", 3) == 0) {
+                ts3 = strtoull((char *)data + 3, NULL, 10);
+                printf("Terima dari ESP2: ts3 = %llu\n", ts3);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void print_result_task(void *arg) {
+    while (1) {
+        if (ts1_sent && ts2_sent && ts3 > 0) {
+            printf("TOA: Mic1 = %llu µs, Mic2 = %llu µs, Mic3 = %llu µs\n", ts1, ts2, ts3);
+            // Reset agar siap event baru
+            ts1_sent = ts2_sent = false;
+            ts3 = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void app_main() {
+    init_i2s(I2S_NUM_0, MIC1_SCK, MIC1_WS, MIC1_SD);
+    init_i2s(I2S_NUM_1, MIC2_SCK, MIC2_WS, MIC2_SD);
+    init_uart();
+
+    xTaskCreatePinnedToCore(mic1_task, "mic1", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(mic2_task, "mic2", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(uart_receive_task, "uart_rx", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(print_result_task, "print", 4096, NULL, 1, NULL, 0);
+}

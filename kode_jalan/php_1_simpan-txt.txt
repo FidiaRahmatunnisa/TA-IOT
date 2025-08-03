@@ -1,0 +1,19 @@
+<?php
+header('Content-Type: text/plain');
+
+// Ambil parameter dari URL
+$ts1    = $_GET['ts1']    ?? '';
+$ts2    = $_GET['ts2']    ?? '';
+$ts3    = $_GET['ts3']    ?? '';
+$lokasi = $_GET['lokasi'] ?? 'TIDAK DIKETAHUI';
+
+// Format log sebagai teks biasa (dengan waktu server)
+$log_line = "Waktu: " . date("Y-m-d H:i:s") . " | TS1: $ts1 | TS2: $ts2 | TS3: $ts3 | Lokasi: $lokasi\n";
+
+// Simpan ke file teks
+file_put_contents("data-log.txt", $log_line, FILE_APPEND);
+
+// Tampilkan hasil ke browser / ESP32
+echo "DATA TERSIMPAN!\n";
+echo $log_line;
+?>
