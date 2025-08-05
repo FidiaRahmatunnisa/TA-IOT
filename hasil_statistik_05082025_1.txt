@@ -1,0 +1,41 @@
+=== HASIL PERHITUNGAN STATISTIK ===
+
+--- Statistik untuk M1 ---
+M1_STE:
+  Mean     : 1596092.83
+  Std Dev  : 9796849.95
+  Min      : 438.64
+  Max      : 127497744.00
+
+M1_ZCR:
+  Mean     : 0.07
+  Std Dev  : 0.06
+  Min      : 0.00
+  Max      : 0.29
+
+M1_PEAK:
+  Mean     : 876.52
+  Std Dev  : 2357.43
+  Min      : 59.00
+  Max      : 19927.00
+
+--- Statistik untuk M2 ---
+M2_STE:
+  Mean     : 47216.37
+  Std Dev  : 273742.36
+  Min      : 121.14
+  Max      : 3478700.00
+
+M2_ZCR:
+  Mean     : 0.04
+  Std Dev  : 0.05
+  Min      : 0.00
+  Max      : 0.41
+
+M2_PEAK:
+  Mean     : 210.79
+  Std Dev  : 451.95
+  Min      : 37.00
+  Max      : 4686.00
+
+=== Selesai ===

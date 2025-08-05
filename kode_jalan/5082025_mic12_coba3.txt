@@ -156,13 +156,13 @@ void mic1_task(void *arg) {
         int peak, idx;
         compute_ste_zcr(mic1_buf, &ste, &zcr, &peak, &idx);
         //===Waktu gabungan idx-global => UNTUK TEST
-        uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
-        uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+        // uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
+        // uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
 
         if (peak > PEAK_THRESHOLD1 && ste > STE_THRESHOLD1 && zcr < ZCR_THRESHOLD1) {
         //===Waktu gabungan idx-global => UNTUK SERIUS
-        // uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
-        // uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+        uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
+        uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
 
         if (xSemaphoreTake(toa_mutex, portMAX_DELAY)) {
             toa_mic1 = ts;
@@ -179,15 +179,6 @@ void mic1_task(void *arg) {
         // printf("Terkirim: %s", buffer);
 
         vTaskDelay(pdMS_TO_TICKS(500));
-    }else{
-          printf("TRESHOLD-1 mungkin besar jadi tidak ada nilai yang keluar\n");
-           //===lengkap = waktu + treshold
-                char buffer[256];
-                snprintf(buffer, sizeof(buffer),
-                    "M1:%06llu | STE:%.2f ZCR:%.2f PEAK:%d\n",
-                    ts, ste, zcr, peak);
-                uart_write_bytes(UART_PORT_NUM, buffer, strlen(buffer));
-                printf("%s", buffer);
     }
 
     }
@@ -202,13 +193,13 @@ void mic2_task(void *arg) {
         int peak, idx;
         compute_ste_zcr(mic2_buf, &ste, &zcr, &peak, &idx);
         //===Waktu gabungan idx-global
-        uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
-        uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+        // uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
+        // uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
 
         if (peak > PEAK_THRESHOLD2 && ste > STE_THRESHOLD2 && zcr < ZCR_THRESHOLD2) {
         //===Waktu gabungan idx-global => UNTUK SERIUS
-        // uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
-        // uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
+        uint64_t now = esp_timer_get_time(); // waktu saat buffer diterima
+        uint64_t ts = now - ((I2S_READ_LEN - idx) * 1000000ULL / SAMPLE_RATE);
 
         if (xSemaphoreTake(toa_mutex, portMAX_DELAY)) {
             toa_mic2 = ts;
@@ -225,15 +216,6 @@ void mic2_task(void *arg) {
         // printf("Terkirim: %s", buffer);
 
         vTaskDelay(pdMS_TO_TICKS(500));
-    }else{
-        printf("TRESHOLD-2 mungkin besar jadi tidak ada nilai yang keluar\n");
-         //===lengkap = waktu + treshold
-                char buffer[256];
-                snprintf(buffer, sizeof(buffer),
-                    "M2:%06llu | STE:%.2f ZCR:%.2f PEAK:%d \n ",
-                    ts, ste, zcr, peak);
-                uart_write_bytes(UART_PORT_NUM, buffer, strlen(buffer));
-                printf("%s", buffer);
     }
 
     }
