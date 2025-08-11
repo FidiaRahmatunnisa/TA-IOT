@@ -218,14 +218,6 @@ void mic3_task(void *arg) {
             if (peak > thr.peak_thr && ste > thr.ste_thr && zcr < thr.zcr_thr) {
                 ESP_LOGI(TAG, "Event DETECTED: STE=%.2f PEAK=%d ZCR=%.4f", ste, peak, zcr);
             }
-            // berbagai jenis output
-            // if (peak > thr.peak_thr && ste > thr.ste_thr && zcr < thr.zcr_thr) {
-            //     ESP_LOGI(TAG, "Event DETECTED: STE=%.2f PEAK=%d ZCR=%.4f -> SESUAI",
-            //             ste, peak, zcr);
-            // } else {
-            //     ESP_LOGI(TAG, "Event NOT DETECTED: STE=%.2f PEAK=%d ZCR=%.4f -> TIDAK SESUAI",
-            //             ste, peak, zcr);
-            // }
         }
     }
 }
