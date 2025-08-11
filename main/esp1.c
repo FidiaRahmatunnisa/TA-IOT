@@ -6,8 +6,8 @@
 #include <string.h>
 
 #define UART_NUM        UART_NUM_1
-#define UART_TX_PIN     17    // Sesuaikan dengan wiring TX ESP1 (ke RX ESP2)
-#define UART_RX_PIN     16    // Sesuaikan dengan wiring RX ESP1 (dari TX ESP2)
+#define UART_TX_PIN     17    // TX ESP1 ke RX ESP2
+#define UART_RX_PIN     16    // RX ESP1 dari TX ESP2
 #define BUF_SIZE        1024
 
 static const char *TAG = "ESP1_UART_Master";
@@ -35,18 +35,17 @@ void send_time_task(void *arg) {
         } else {
             ESP_LOGW(TAG, "Gagal kirim data UART");
         }
-        vTaskDelay(pdMS_TO_TICKS(100));  // kirim tiap 100ms
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
 // Task terima ACK dari ESP2
 void uart_receive_ack_task(void *arg) {
-    uint8_t buf[128];
+    uint8_t buf[64];
     while (1) {
-        int len = uart_read_bytes(UART_NUM, buf, sizeof(buf) - 1, 100 / portTICK_PERIOD_MS);
+        int len = uart_read_bytes(UART_NUM, buf, sizeof(buf), 100 / portTICK_PERIOD_MS);
         if (len > 0) {
-            buf[len] = '\0';  // pastikan string valid
-            ESP_LOGI(TAG, "Terima %d byte dari ESP2: '%s'", len, buf);
+            ESP_LOGI(TAG, "Terima %d byte dari ESP2: '%.*s'", len, len, buf);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
