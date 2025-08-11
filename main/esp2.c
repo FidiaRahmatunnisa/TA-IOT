@@ -231,7 +231,7 @@ void mic3_task(void *arg) {
 }
 
 // ---- app_main ----
-void app_main(void) {
+void app_main2(void) {
     nvs_flash_init();
     nvs_open("storage", NVS_READWRITE, &nvs_handle_app);
     init_i2s_mic3();
