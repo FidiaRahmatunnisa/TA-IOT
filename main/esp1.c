@@ -190,7 +190,7 @@ void mic1_task(void *arg) {
                 printf("%s", buffer);
     }
 
-    }
+        }
 }
 
 // === Task Mic2 ===
