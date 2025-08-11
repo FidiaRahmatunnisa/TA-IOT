@@ -59,7 +59,6 @@ void uart_receive_ack_task(void *arg) {
     }
 }
 
-
 void app_main1(void) {
     uart_init();
     xTaskCreate(send_time_task, "send_time_task", 2048, NULL, 5, NULL);
