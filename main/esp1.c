@@ -20,23 +20,6 @@ int peak_mic1 = 0, peak_mic2 = 0;
 // === Konfigurasi Umum ===
 #define SAMPLE_RATE     96000
 #define I2S_READ_LEN    1024
-//===umum
-// #define THRESHOLD       100
-// #define STE_THRESHOLD   200000.0f
-// #define ZCR_THRESHOLD   0.2f
-
-// === Threshold Berdasarkan Mean dan StdDev UMUM===
-// #define STE_MEAN        16000
-// #define STE_STDDEV      3000
-// #define STE_THRESHOLD   (STE_MEAN + 2 * STE_STDDEV)  
-
-// #define PEAK_MEAN       5000
-// #define PEAK_STDDEV     2000
-// #define PEAK_THRESHOLD  (PEAK_MEAN + 2 * PEAK_STDDEV)  
-
-// #define ZCR_MEAN        40
-// #define ZCR_STDDEV      10
-// #define ZCR_THRESHOLD   (ZCR_MEAN - 2 * ZCR_STDDEV)  
 
 //===treshold-mic1
 #define STE_MEAN1        1596092.83
