@@ -1,66 +1,78 @@
+#include <string.h>
+#include "esp_now.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
-#include "esp_timer.h"
-#include "esp_log.h"
-#include <string.h>
 
-#define UART_NUM        UART_NUM_1
-#define UART_TX_PIN     17    // TX ESP1 ke RX ESP2
-#define UART_RX_PIN     16    // RX ESP1 dari TX ESP2
-#define BUF_SIZE        1024
+static const char *TAG = "ESP1_MASTER";
 
-static const char *TAG = "ESP1_UART_Master";
+// MAC ESP2 (Slave) yang akan kita terima data dari dia
+uint8_t slave_mac[6] = {0x6c, 0xc8, 0x40, 0x33, 0xf5, 0xa0};
 
-void uart_init() {
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
-    uart_param_config(UART_NUM, &uart_config);
-    uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(UART_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
+void wifi_init(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "WiFi diinisialisasi dan mulai dalam mode STA");
 }
 
-// Task kirim timestamp tiap 100 ms
-void send_time_task(void *arg) {
-    while (1) {
-        uint64_t t = esp_timer_get_time(); // waktu mikrodetik sejak ESP menyala
-        int len = uart_write_bytes(UART_NUM, (const char*)&t, sizeof(t));
-        if (len == sizeof(t)) {
-            ESP_LOGI(TAG, "Kirim timestamp: %llu", t);
-        } else {
-            ESP_LOGW(TAG, "Gagal kirim data UART");
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+
+    if (len == sizeof(uint64_t)) {
+        uint64_t ts_received;
+        memcpy(&ts_received, data, sizeof(ts_received));
+        ESP_LOGI(TAG, "Terima timestamp dari %s: %llu", macStr, ts_received);
+    } else {
+        ESP_LOGW(TAG, "Panjang data diterima salah dari %s: %d", macStr, len);
     }
 }
 
-// Task terima ACK dari ESP2
-void uart_receive_ack_task(void *arg) {
-    uint8_t buf[64];
-    int len;
-    uint64_t timestamp_from_esp2 = 0;
+void espnow_init(void)
+{
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));  // sesuaikan dengan fungsi callback baru
 
-    while (1) {
-        len = uart_read_bytes(UART_NUM, buf, sizeof(buf), 100 / portTICK_PERIOD_MS);
-        if (len >= sizeof(uint64_t)) {
-            // Ambil 8 byte pertama sebagai timestamp
-            memcpy(&timestamp_from_esp2, buf, sizeof(uint64_t));
-            ESP_LOGI(TAG, "Terima timestamp sinkron dari ESP2: %llu", timestamp_from_esp2);
-        } else if (len > 0) {
-            // Jika data kurang dari 8 byte, tampilkan sebagai string saja
-            ESP_LOGI(TAG, "Terima data dari ESP2: '%.*s'", len, buf);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    // Daftarkan peer ESP2
+    esp_now_peer_info_t peerInfo = {0};
+    memcpy(peerInfo.peer_addr, slave_mac, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+
+    ESP_ERROR_CHECK(esp_now_add_peer(&peerInfo));
+    ESP_LOGI(TAG, "Peer ESP2 didaftarkan");
 }
 
-void app_main1(void) {
-    uart_init();
-    xTaskCreate(send_time_task, "send_time_task", 2048, NULL, 5, NULL);
-    xTaskCreate(uart_receive_ack_task, "uart_receive_ack_task", 2048, NULL, 5, NULL);
+
+void app_main1(void)
+{
+    ESP_LOGI(TAG, "Mulai ESP1 MASTER");
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    wifi_init();
+
+    // Set WiFi channel ke 1 supaya sinkron channel dengan peer
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
+
+    espnow_init();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
