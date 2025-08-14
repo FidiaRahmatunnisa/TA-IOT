@@ -18,7 +18,7 @@ typedef struct __attribute__((packed)) {
     uint64_t timestamp;
     float ste;
     float zcr;
-    int peak;
+    int32_t peak;
     int mode;
 } mic3_data_t;
 
@@ -58,7 +58,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         mic3_data_t mic_data;
         memcpy(&mic_data, data, sizeof(mic_data));
 
-        ESP_LOGI(TAG, "[MIC3] Dari %s: ts=%llu STE=%.2f ZCR=%.4f Peak=%d Mode=%d",
+        ESP_LOGI(TAG, "[MIC3] Dari %s: ts=%llu STE=%.2f ZCR=%.4f Peak=%ld Mode=%d",
                  macStr, mic_data.timestamp, mic_data.ste, mic_data.zcr, mic_data.peak, mic_data.mode);
     }
     else {
@@ -81,7 +81,7 @@ void espnow_init(void)
     ESP_LOGI(TAG, "Peer ESP2 didaftarkan");
 }
 
-void app_main1(void)
+void app_main(void)
 {
     ESP_LOGI(TAG, "Mulai ESP1 MASTER");
 

@@ -216,7 +216,7 @@ void espnow_init(void)
 }
 
 // ---- app_main ----
-void app_main2(void)
+void app_main(void)
 {
     nvs_flash_init();
     espnow_init();
