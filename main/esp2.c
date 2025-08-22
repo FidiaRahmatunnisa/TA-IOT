@@ -36,8 +36,8 @@ typedef struct {
 typedef struct {
     uint64_t timestamp; // hasil sinkronisasi
     float ste;
-    int peak;
     float zcr;
+    int32_t peak;
 } mic3_packet_t;
 
 // Global offset untuk sinkronisasi waktu
@@ -161,7 +161,8 @@ static void espnow_send_task(void *arg) {
             packet = mic3_data_global;
             xSemaphoreGive(mic_data_mutex);
 
-            esp_now_send(master_mac, (uint8_t *)&packet, sizeof(packet));
+            // esp_now_send(master_mac, (uint8_t *)&packet, sizeof(packet));
+            esp_now_send(master_mac, (uint8_t*)&mic3_data_global, sizeof(mic3_data_global));
         } else {
             uint64_t ts_sync = offset_calculated ? (esp_timer_get_time() + offset) : esp_timer_get_time();
             esp_now_send(master_mac, (uint8_t *)&ts_sync, sizeof(ts_sync));

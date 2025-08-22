@@ -81,7 +81,7 @@ void espnow_init(void)
     ESP_LOGI(TAG, "Peer ESP2 didaftarkan");
 }
 
-void app_main(void)
+void app_main1(void)
 {
     ESP_LOGI(TAG, "Mulai ESP1 MASTER");
 
