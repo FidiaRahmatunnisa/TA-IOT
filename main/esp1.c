@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>    
 #include <stdlib.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"   
@@ -20,7 +21,6 @@
 
 
 // ---------------- CONFIG --------------
-// #define N_EVENTS                100
 #define SAMPLE_RATE             96000
 #define I2S_READ_LEN            1024
 #define CAL_SAMPLE_INTERVAL_MS  100
@@ -40,8 +40,10 @@
 // Event bits for sync
 #define EVT_MIC1_CALIB_DONE (1<<0)
 #define EVT_MIC2_CALIB_DONE (1<<1)
+#define EVT_MIC3_CALIB_DONE (1<<2)
 
 static const char *TAG = "ESP1_MASTER";
+#define SYNC_START "SYNC_START"
 
 // MAC ESP2 (Slave)
 static uint8_t slave_mac[6] = {0x6c, 0xc8, 0x40, 0x33, 0xf5, 0xa0};
@@ -55,30 +57,11 @@ typedef struct __attribute__((packed)) {
     int      mode;     
 } mic3_data_t;
 
-// === Mode Kalibrasi ===
-typedef enum {
-    MODE_DETECTION = 0, //dihilangkan karena akan dilakukan bersama
-    MODE_CAL_NOISE = 1,
-    MODE_CAL_TARGET = 2,
-    MODE_CAL_RESULT = 3
-} mic_mode_t;
-
 // === variabel untuk mean-std ===
 typedef struct {
     double mean;
     double std;
 } stat_t;
-
-// === Globals ===
-static nvs_handle_t nvs_handle_app;
-static uint64_t start_time_us;
-static mic_mode_t current_mode = MODE_CAL_NOISE;
-static EventGroupHandle_t eg;
-static SemaphoreHandle_t feat_mutex;
-static nvs_handle_t nvs_handle_app1 = 0;
-
-// Queue 1-slot untuk sampel mic3 (pakai overwrite agar selalu dapat yang terbaru)
-static QueueHandle_t mic3_queue = NULL;
 
 // Feature struct
 typedef struct {
@@ -96,12 +79,22 @@ typedef struct {
     double zcr_thr;
 } thr_t;
 
-// === variabel untuk ste-zcr-peak ===
-// typedef struct {
-//     double ste_thr;
-//     double peak_thr;
-//     double zcr_thr;
-// } threshold_t;
+// === Mode Kalibrasi ===harus diatas current_mode deklarasinya
+typedef enum {
+    MODE_CAL_NOISE = 0,   
+    MODE_CAL_EVENT,       
+    MODE_NORMAL           
+} mic_mode_t;
+
+// === Globals ===
+static uint64_t start_time_us;
+static mic_mode_t current_mode = MODE_CAL_NOISE;
+static EventGroupHandle_t eg;
+static SemaphoreHandle_t feat_mutex;
+static nvs_handle_t nvs_handle_app = 0;
+
+// Queue 1-slot untuk sampel mic3 (pakai overwrite agar selalu dapat yang terbaru)
+static QueueHandle_t mic3_queue = NULL;
 
 // Kalibrasi buffer dan counter mic1
 static float m1_ste[N_EVENTS], m1_zcr[N_EVENTS], m1_peak[N_EVENTS];
@@ -506,123 +499,94 @@ static void mic2_calib_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ==== MIC3 MODE TASK (kalibrasi/deteksi mic3 di ESP1) ====
-static void mode_task(void *arg)
+// ==== Mic3 CALIB TASK (data dari ESP2 via ESPNOW) ====
+static void mic3_calib_task(void *arg)
 {
-    float ste_list[N_EVENTS], zcr_list[N_EVENTS], peak_list[N_EVENTS];
-    int collected = 0;
-    thr_t thr;
-    stat_t noise_ste, noise_peak, noise_zcr;
-    stat_t target_ste, target_peak, target_zcr;
+    ESP_LOGI(TAG, "mic3_calib_task waiting mic2");
 
-    // Pastikan kita punya queue
-    configASSERT(mic3_queue != NULL);
+    // Tunggu sampai mic2 selesai kalibrasi
+    xEventGroupWaitBits(eg, EVT_MIC2_CALIB_DONE, pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "mic3_calib_task started");
 
-    while (1) {
-        mic3_data_t sample;
+    float ste_buf[N_EVENTS], zcr_buf[N_EVENTS], peak_buf[N_EVENTS];
+    int collected;
+    mic3_data_t sample;
 
-        // Tunggu sampel mic3 dari ESP2
-        if (xQueueReceive(mic3_queue, &sample, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
+    // ==== Step 1: kalibrasi noise mic3 ====
+    collected = 0;
+    while (collected < N_EVENTS) {
+        if (xQueueReceive(mic3_queue, &sample, portMAX_DELAY) == pdTRUE) {
+            ste_buf[collected]  = sample.ste;
+            zcr_buf[collected]  = sample.zcr;
+            peak_buf[collected] = (float)sample.peak;
+            collected++;
 
-        float ste  = sample.ste;
-        float zcr  = sample.zcr;
-        int   peak = sample.peak;
+            ESP_LOGI(TAG, "mic3 target CAL[%d] STE=%.2f ZCR=%.4f PEAK=%" PRId32, collected, sample.ste, sample.zcr, sample.peak);
 
-        if (current_mode == MODE_CAL_NOISE || current_mode == MODE_CAL_TARGET) {
-            if (collected < N_EVENTS) {
-                ste_list[collected]  = ste;
-                zcr_list[collected]  = zcr;
-                peak_list[collected] = (float)peak;
-                collected++;
 
-                ESP_LOGI(TAG, "CAL[%s] %d/%d t_ESP2=%llu  STE=%.2f  ZCR=%.4f  PEAK=%d",
-                         (current_mode == MODE_CAL_NOISE ? "NOISE" : "TARGET"),
-                         collected, N_EVENTS, (unsigned long long)sample.timestamp, ste, zcr, peak);
-            } else {
-                stat_t s_ste, s_peak, s_zcr;
-                compute_mean_std(ste_list,  N_EVENTS, &s_ste.mean,  &s_ste.std);
-                compute_mean_std(peak_list, N_EVENTS, &s_peak.mean, &s_peak.std);
-                compute_mean_std(zcr_list,  N_EVENTS, &s_zcr.mean,  &s_zcr.std);
-
-                // ✅ Debug print sebelum disimpan
-                ESP_LOGI(TAG, "DEBUG: s_ste.mean=%.2f s_peak.mean=%.2f s_zcr.mean=%.4f", s_ste.mean, s_peak.mean, s_zcr.mean);
-
-                if (current_mode == MODE_CAL_NOISE) {
-                    // save_stat("noise_ste_m",  "noise_ste_s",  s_ste);
-                    // save_stat("noise_peak_m", "noise_peak_s", s_peak);
-                    // save_stat("noise_zcr_m",  "noise_zcr_s",  s_zcr);
-                    save_stat("mic3_noise_ste", s_ste);
-                    save_stat("mic3_noise_peak", s_peak);
-                    save_stat("mic3_noise_zcr", s_zcr);
-                    ESP_LOGI(TAG, "Noise stats saved");
-                } else { // MODE_CAL_TARGET
-                    // save_stat("target_ste_m",  "target_ste_s",  s_ste);
-                    // save_stat("target_peak_m", "target_peak_s", s_peak);
-                    // save_stat("target_zcr_m",  "target_zcr_s",  s_zcr);
-                    save_stat("mic3_target_ste", s_ste);
-                    save_stat("mic3_target_peak", s_peak);
-                    save_stat("mic3_target_zcr", s_zcr);
-                    ESP_LOGI(TAG, "Target stats saved");
-                }
-
-                collected = 0;
-                vTaskDelay(pdMS_TO_TICKS(MODE_DELAY_MS));
-                current_mode++;
-                ESP_LOGI(TAG, "Switched mode -> %d", current_mode);
-            }
-        }
-        else if (current_mode == MODE_CAL_RESULT) {
-            // load_stat("noise_ste_m",  "noise_ste_s",  &noise_ste);
-            // load_stat("noise_peak_m", "noise_peak_s", &noise_peak);
-            // load_stat("noise_zcr_m",  "noise_zcr_s",  &noise_zcr);
-            // load_stat("target_ste_m",  "target_ste_s",  &target_ste);
-            // load_stat("target_peak_m", "target_peak_s", &target_peak);
-            // load_stat("target_zcr_m",  "target_zcr_s",  &target_zcr);
-            ESP_LOGI(TAG, "DEBUG: about to load mic3_target_ste");
-            // beri waktu NVS commit stabil
-            vTaskDelay(pdMS_TO_TICKS(500)); // 50–100 ms biasanya cukup
-
-            load_stat("mic3_noise_ste",  &noise_ste);
-            load_stat("mic3_noise_peak", &noise_peak);
-            load_stat("mic3_noise_zcr",  &noise_zcr);
-
-            load_stat("mic3_target_ste",  &target_ste);
-            load_stat("mic3_target_peak", &target_peak);
-            load_stat("mic3_target_zcr",  &target_zcr);
-
-            // ✅ Debug print setelah load
-                ESP_LOGI(TAG, "DEBUG loaded noise_ste.mean=%.2f, noise_peak.mean=%.2f, noise_zcr.mean=%.4f", 
-                        noise_ste.mean, noise_peak.mean, noise_zcr.mean);
-                ESP_LOGI(TAG, "DEBUG loaded target_ste.mean=%.2f, target_peak.mean=%.2f, target_zcr.mean=%.4f", 
-                        target_ste.mean, target_peak.mean, target_zcr.mean);
-
-            thr.ste_thr  = noise_ste.mean  + 0.5 * (target_ste.mean  - noise_ste.mean);
-            thr.peak_thr = noise_peak.mean + 0.5 * (target_peak.mean - noise_peak.mean);
-            thr.zcr_thr  = fmax(0.0, noise_zcr.mean - 0.5 * noise_zcr.std);
-
-            // save_threshold(thr);
-            save_thr("mic3", thr);
-            ESP_LOGI(TAG, "t_ESP2=%llu | Threshold saved: STE=%.2f  PEAK=%.2f  ZCR=%.4f",
-                     (unsigned long long)sample.timestamp, thr.ste_thr, thr.peak_thr, thr.zcr_thr);
-
-            vTaskDelay(pdMS_TO_TICKS(MODE_DELAY_MS));
-            current_mode = MODE_DETECTION;
-            ESP_LOGI(TAG, "Switched mode -> MODE_DETECTION");
-            // ✅ Kalibrasi Mic3 selesai, set flag
-            calib_done = true;
-        }
-        // ini akan dimasukan ke task yang sama dengan mic1 dan mic2
-        else if (current_mode == MODE_DETECTION) {
-            // load_threshold(&thr);
-            // if ((peak > thr.peak_thr) && (ste > thr.ste_thr) && (zcr < thr.zcr_thr)) {
-            //     ESP_LOGI(TAG, "t_ESP2=%llu | Event DETECTED: STE=%.2f  PEAK=%d  ZCR=%.4f", (unsigned long long)sample.timestamp, ste, peak, zcr);
-            // }
-            xQueueOverwrite(mic3_queue, &sample);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(CAL_SAMPLE_INTERVAL_MS));
         }
     }
+
+    // hitung & simpan noise
+    double mean_ste, std_ste, mean_zcr, std_zcr, mean_peak, std_peak;
+    compute_mean_std(ste_buf,  N_EVENTS, &mean_ste, &std_ste);
+    compute_mean_std(zcr_buf,  N_EVENTS, &mean_zcr, &std_zcr);
+    compute_mean_std(peak_buf, N_EVENTS, &mean_peak, &std_peak);
+
+    stat_t noise_ste  = {mean_ste, std_ste};
+    stat_t noise_zcr  = {mean_zcr, std_zcr};
+    stat_t noise_peak = {mean_peak, std_peak};
+    save_stat("mic3_noise_ste", noise_ste);
+    save_stat("mic3_noise_zcr", noise_zcr);
+    save_stat("mic3_noise_peak", noise_peak);
+    ESP_LOGI(TAG, "mic3 noise stats saved");
+
+    vTaskDelay(pdMS_TO_TICKS(5000)); // jeda
+
+    // ==== Step 2: kalibrasi target mic3 ====
+    collected = 0;
+    while (collected < N_EVENTS) {
+        if (xQueueReceive(mic3_queue, &sample, portMAX_DELAY) == pdTRUE) {
+            ste_buf[collected]  = sample.ste;
+            zcr_buf[collected]  = sample.zcr;
+            peak_buf[collected] = (float)sample.peak;
+            collected++;
+
+            ESP_LOGI(TAG, "mic3 target CAL[%d] STE=%.2f ZCR=%.4f PEAK=%" PRId32, collected, sample.ste, sample.zcr, sample.peak);
+
+            vTaskDelay(pdMS_TO_TICKS(CAL_SAMPLE_INTERVAL_MS));
+        }
+    }
+
+    // hitung & simpan target
+    compute_mean_std(ste_buf,  N_EVENTS, &mean_ste, &std_ste);
+    compute_mean_std(zcr_buf,  N_EVENTS, &mean_zcr, &std_zcr);
+    compute_mean_std(peak_buf, N_EVENTS, &mean_peak, &std_peak);
+
+    stat_t target_ste  = {mean_ste, std_ste};
+    stat_t target_zcr  = {mean_zcr, std_zcr};
+    stat_t target_peak = {mean_peak, std_peak};
+    save_stat("mic3_target_ste", target_ste);
+    save_stat("mic3_target_zcr", target_zcr);
+    save_stat("mic3_target_peak", target_peak);
+    ESP_LOGI(TAG, "mic3 target stats saved");
+
+    // ==== Step 3: hitung threshold mic3 ====
+    thr_t thr3;
+    thr3.ste_thr  = noise_ste.mean  + 0.5 * (target_ste.mean  - noise_ste.mean);
+    thr3.peak_thr = noise_peak.mean + 0.5 * (target_peak.mean - noise_peak.mean);
+    thr3.zcr_thr  = fmax(0.0, noise_zcr.mean - 0.5 * noise_zcr.std);
+    save_thr("mic3", thr3);
+
+    ESP_LOGI(TAG, "MIC3 thresholds: STE=%.2f, PEAK=%.2f, ZCR=%.4f",
+             thr3.ste_thr, thr3.peak_thr, thr3.zcr_thr);
+
+    // tandai mic3 sudah selesai kalibrasi
+    calib_done = true;
+    xEventGroupSetBits(eg, EVT_MIC3_CALIB_DONE);
+
+    vTaskDelete(NULL);
 }
 
 // ======= Mic1 Reader Task =======
@@ -804,9 +768,8 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     // 9️⃣ Mulai mode_task untuk mic3 (kalibrasi & mode deteksi)
-    // Mode_task menunggu mic1 & mic2 kalibrasi sebelum hitung threshold gabungan
-    ESP_LOGI(TAG, "Mulai mode_task mic3");
-    xTaskCreatePinnedToCore(mode_task, "mode_task", 12288, NULL, 6, NULL, 1);
+    ESP_LOGI(TAG, "Mulai mic3_calib_task");
+    xTaskCreatePinnedToCore(mic3_calib_task, "mic3_calib_task", 12288, NULL, 6, NULL, 1);
 
     // 8️⃣ Mulai reader mic1 & mic2
     xTaskCreate(mic1_reader_task, "mic1_reader", 4096, NULL, 5, NULL);
