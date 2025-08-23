@@ -170,7 +170,6 @@ static void compute_ste_zcr_peak(int32_t *buf, int len, float *ste_out, float *z
     *idx_out = idx;
 }
 
-
 // ==== mean/std ====
 // ini yang dari mic1mic2
 static void compute_mean_std(const float *arr, int n, double *mean_out, double *std_out)
@@ -499,7 +498,7 @@ static void mic2_calib_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ==== Mic3 CALIB TASK (data dari ESP2 via ESPNOW) ====
+// ==== Mic3 MODE TASK (data dari ESP2 via ESPNOW) ====
 static void mic3_calib_task(void *arg)
 {
     ESP_LOGI(TAG, "mic3_calib_task waiting mic2");
@@ -521,7 +520,7 @@ static void mic3_calib_task(void *arg)
             peak_buf[collected] = (float)sample.peak;
             collected++;
 
-            ESP_LOGI(TAG, "mic3 target CAL[%d] STE=%.2f ZCR=%.4f PEAK=%" PRId32, collected, sample.ste, sample.zcr, sample.peak);
+            ESP_LOGI(TAG, "mic3 noise CAL[%d] STE=%.2f ZCR=%.4f PEAK=%" PRId32, collected, sample.ste, sample.zcr, sample.peak);
 
 
             vTaskDelay(pdMS_TO_TICKS(CAL_SAMPLE_INTERVAL_MS));
@@ -662,17 +661,45 @@ static void detection_task(void *arg)
     // Baca threshold kalibrasi sekali saja di awal
     load_thr("m1", &thr1);
     load_thr("m2", &thr2);
-    load_thr("m3", &thr3);
+    load_thr("mic3", &thr3);
 
     while (1) {
         feat_t f1, f2, f3;
+
+        // ===== Ambil data mic3 dari queue (kalau ada kiriman baru) =====
+        mic3_data_t pkt;
+        if (xQueueReceive(mic3_queue, &pkt, 0)) {
+            feat_t tmp;
+            tmp.ste   = pkt.ste;
+            tmp.zcr   = pkt.zcr;
+            tmp.peak  = pkt.peak;
+            tmp.idx   = 0;                // bisa diisi kalau ESP2 juga kirim idx
+            tmp.ts_us = pkt.timestamp;    // timestamp dari ESP2
+
+            // update last_m3 di dalam proteksi mutex
+            if (xSemaphoreTake(feat_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                last_m3 = tmp;
+                xSemaphoreGive(feat_mutex);
+            }
+            // ===== DEBUG MIC3 DATA MASUK ===== [berhasil]
+        //    ESP_LOGI(TAG, "[MIC3 RECV] ts=%llu us | STE=%.2f | PEAK=%ld | ZCR=%.4f",
+        //  (unsigned long long)pkt.timestamp,
+        //  pkt.ste,
+        //  (long)pkt.peak,   // cast biar aman
+        //  pkt.zcr);
+
+        }
 
         // Ambil data fitur dengan proteksi semaphore
         if (xSemaphoreTake(feat_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             f1 = last_m1;
             f2 = last_m2;
             f3 = last_m3;
-            xSemaphoreGive(feat_mutex);
+            // ==== DEBUG MIC3 ==== [berhasil]
+            // ESP_LOGI("DEBUG", "MIC3: STE=%.2f | PEAK=%d | ZCR=%.4f | TS=%llu us",
+            //  f3.ste, f3.peak, f3.zcr, (unsigned long long)f3.ts_us);
+           
+             xSemaphoreGive(feat_mutex);
         } else {
             ESP_LOGW(TAG, "Failed to take feat_mutex");
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -684,7 +711,15 @@ static void detection_task(void *arg)
         bool d2 = (f2.peak > thr2.peak_thr) && (f2.ste > thr2.ste_thr) && (f2.zcr < thr2.zcr_thr);
         bool d3 = (f3.peak > thr3.peak_thr) && (f3.ste > thr3.ste_thr) && (f3.zcr < thr3.zcr_thr);
 
-        if (d1 || d2) {
+        // DEBUG : ketahuan kalau disini [thr nya mic3 kosong] -> [berhasil, m3 pada load_thr dirubah jadi mic3]
+        // ESP_LOGI("DEBUG", 
+        //  "COND: d1=%d d2=%d d3=%d | Mic1: STE=%.2f PEAK=%d ZCR=%.4f Thr(STE=%.2f PEAK=%d ZCR=%.4f)",
+        //  d1, d2, d3,
+        //  f3.ste, (int)f3.peak, f3.zcr,
+        //  thr3.ste_thr, (int)thr3.peak_thr, thr3.zcr_thr);
+
+
+        if (d1 || d2 || d3) {
             // Hitung waktu kedatangan suara (TOA) relatif
             uint64_t idx_off1 = ((uint64_t)f1.idx * 1000000ULL) / SAMPLE_RATE;
             uint64_t idx_off2 = ((uint64_t)f2.idx * 1000000ULL) / SAMPLE_RATE;
@@ -693,6 +728,10 @@ static void detection_task(void *arg)
             uint64_t toa1 = (f1.ts_us >= idx_off1) ? (f1.ts_us - idx_off1) : f1.ts_us;
             uint64_t toa2 = (f2.ts_us >= idx_off2) ? (f2.ts_us - idx_off2) : f2.ts_us;
             uint64_t toa3 = (f3.ts_us >= idx_off3) ? (f3.ts_us - idx_off3) : f3.ts_us;
+
+             // ==== DEBUG MIC3 DATA ==== [berhasil]
+            // ESP_LOGI("DEBUG", "MIC3: TOA=%llu us | STE=%.2f | PEAK=%d | ZCR=%.4f",
+            //  (unsigned long long)toa3, f3.ste, f3.peak, f3.zcr);
 
            // Tentukan siapa yang pertama
             if (d1 && (!d2 || toa1 <= toa2) && (!d3 || toa1 <= toa3)) {
