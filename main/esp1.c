@@ -1,10 +1,13 @@
-// ==== ESP1 MASTER (mic3-only, 4 modes on master) ====
+// ==== ESP1 MASTER (mic1-mic2-mic3, 4 modes on master) ====
 
 #include <string.h>
-#include <math.h>                  // sqrt, fmax
+#include <math.h>    
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"        
+#include "freertos/queue.h"   
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"     
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -15,7 +18,13 @@
 #include "esp_timer.h"
 #include "driver/i2s.h"
 
-#define N_EVENTS        100
+
+// ---------------- CONFIG --------------
+// #define N_EVENTS                100
+#define SAMPLE_RATE             96000
+#define I2S_READ_LEN            1024
+#define CAL_SAMPLE_INTERVAL_MS  100
+#define N_EVENTS        30
 #define MODE_DELAY_MS   5000
 
 // Pins I2S Mic1 (I2S_NUM_0)
@@ -28,12 +37,10 @@
 #define MIC2_WS     27
 #define MIC2_SD     33
 
-#define SAMPLE_RATE        (16000)
-#define I2S_SAMPLE_BITS    (32)
-#define I2S_READ_LEN       (1024)
+// Event bits for sync
+#define EVT_MIC1_CALIB_DONE (1<<0)
+#define EVT_MIC2_CALIB_DONE (1<<1)
 
-static const char *TAG_MIC1 = "I2S_MIC1";
-static const char *TAG_MIC2 = "I2S_MIC2";
 static const char *TAG = "ESP1_MASTER";
 
 // MAC ESP2 (Slave)
@@ -48,31 +55,67 @@ typedef struct __attribute__((packed)) {
     int      mode;     
 } mic3_data_t;
 
+// === Mode Kalibrasi ===
 typedef enum {
-    MODE_DETECTION = 0,
+    MODE_DETECTION = 0, //dihilangkan karena akan dilakukan bersama
     MODE_CAL_NOISE = 1,
     MODE_CAL_TARGET = 2,
     MODE_CAL_RESULT = 3
 } mic_mode_t;
 
+// === variabel untuk mean-std ===
 typedef struct {
     double mean;
     double std;
 } stat_t;
 
-typedef struct {
-    double ste_thr;
-    double peak_thr;
-    double zcr_thr;
-} threshold_t;
-
 // === Globals ===
 static nvs_handle_t nvs_handle_app;
 static uint64_t start_time_us;
 static mic_mode_t current_mode = MODE_CAL_NOISE;
+static EventGroupHandle_t eg;
+static SemaphoreHandle_t feat_mutex;
+static nvs_handle_t nvs_handle_app1 = 0;
 
 // Queue 1-slot untuk sampel mic3 (pakai overwrite agar selalu dapat yang terbaru)
 static QueueHandle_t mic3_queue = NULL;
+
+// Feature struct
+typedef struct {
+    float ste;
+    float zcr;
+    int peak;
+    int idx;
+    uint64_t ts_us;
+} feat_t;
+
+// Threshold struct
+typedef struct {
+    double ste_thr;
+    double peak_thr;
+    double zcr_thr;
+} thr_t;
+
+// === variabel untuk ste-zcr-peak ===
+// typedef struct {
+//     double ste_thr;
+//     double peak_thr;
+//     double zcr_thr;
+// } threshold_t;
+
+// Kalibrasi buffer dan counter mic1
+static float m1_ste[N_EVENTS], m1_zcr[N_EVENTS], m1_peak[N_EVENTS];
+static int m1_col = 0;
+static bool m1_done = false;
+
+// Kalibrasi buffer dan counter mic2
+static float m2_ste[N_EVENTS], m2_zcr[N_EVENTS], m2_peak[N_EVENTS];
+static int m2_col = 0;
+static bool m2_done = false;
+
+// Latest features dari mic1 dan mic2
+static feat_t last_m1 = {0}, last_m2 = {0},  last_m3 = {0};
+static bool calib_done = false;
 
 // ==== WiFi init ====
 static void wifi_init(void)
@@ -86,35 +129,35 @@ static void wifi_init(void)
     ESP_LOGI(TAG, "WiFi STA started");
 }
 
-// ==== I2S init =====
-static void i2s_init(i2s_port_t i2s_num, int ws, int sd, int sck)
+// ======= DUAL I2S init =======
+static void init_i2s_port(i2s_port_t port, int bck, int ws, int sd)
 {
-    i2s_config_t i2s_config = {
+    i2s_config_t cfg = {
         .mode = I2S_MODE_MASTER | I2S_MODE_RX,
         .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_SAMPLE_BITS,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
-        .communication_format = I2S_COMM_FORMAT_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
+        .intr_alloc_flags = 0,
         .dma_buf_count = 4,
-        .dma_buf_len = 256,
+        .dma_buf_len = 64,
         .use_apll = false,
-        .tx_desc_auto_clear = true,
+        .tx_desc_auto_clear = false,
         .fixed_mclk = 0
     };
-
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = sck,
+    i2s_driver_install(port, &cfg, 0, NULL);
+    i2s_pin_config_t pin_cfg = {
+        .bck_io_num = bck,
         .ws_io_num = ws,
         .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = sd
+        .data_in_num = sd,
+        .mck_io_num = I2S_PIN_NO_CHANGE
     };
-
-    ESP_ERROR_CHECK(i2s_driver_install(i2s_num, &i2s_config, 0, NULL));
-    ESP_ERROR_CHECK(i2s_set_pin(i2s_num, &pin_config));
+    i2s_set_pin(port, &pin_cfg);
+    i2s_zero_dma_buffer(port);
 }
 
-// STE - ZCR - PEAK
+// ===== task STE-ZCR-PEAK
 static void compute_ste_zcr_peak(int32_t *buf, int len, float *ste_out, float *zcr_out, int *peak_out, int *idx_out)
 {
     double ste = 0.0;
@@ -134,56 +177,145 @@ static void compute_ste_zcr_peak(int32_t *buf, int len, float *ste_out, float *z
     *idx_out = idx;
 }
 
-// ==== mean/std & NVS helpers ====
-static void compute_mean_std(const float *arr, int n, double *mean_out, double *std_out) {
-    double sum = 0;
-    for (int i = 0; i < n; i++) sum += arr[i];
+
+// ==== mean/std ====
+// ini yang dari mic1mic2
+static void compute_mean_std(const float *arr, int n, double *mean_out, double *std_out)
+{
+    if (n<=0) { *mean_out=0; *std_out=0; return; }
+    double sum=0;
+    for (int i=0;i<n;i++) sum += arr[i];
     double mean = sum / n;
-    double s = 0;
-    for (int i = 0; i < n; i++) s += (arr[i] - mean) * (arr[i] - mean);
+    double s=0;
+    for (int i=0;i<n;i++) {
+        double d = arr[i]-mean;
+        s += d*d;
+    }
     *mean_out = mean;
-    *std_out  = (n > 1) ? sqrt(s / (n - 1)) : 0.0;
+    *std_out = (n>1) ? sqrt(s/(n-1)) : 0.0;
 }
 
-static void save_double(const char *key, double value) {
+// ==== LOAD & SAVE
+//Fungsi dasar NVS untuk double
+static esp_err_t nvs_save_double(const char *key, double v)
+{
     uint64_t raw;
-    memcpy(&raw, &value, sizeof(raw));  // copy bit pattern
-    ESP_ERROR_CHECK(nvs_set_u64(nvs_handle_app, key, raw));
-    ESP_ERROR_CHECK(nvs_commit(nvs_handle_app));
+    memcpy(&raw, &v, sizeof(raw));
+    return nvs_set_u64(nvs_handle_app, key, raw);
 }
 
-static double load_double(const char *key) {
+static double nvs_load_double(const char *key)
+{
     uint64_t raw = 0;
-    esp_err_t err = nvs_get_u64(nvs_handle_app, key, &raw);
-    if (err != ESP_OK) raw = 0;
-    double value;
-    memcpy(&value, &raw, sizeof(value));
-    return value;
+    if (nvs_get_u64(nvs_handle_app, key, &raw) != ESP_OK) return 0.0;
+    double v;
+    memcpy(&v, &raw, sizeof(raw));
+    return v;
 }
 
-static void save_stat(const char *key_mean, const char *key_std, stat_t val) {
-    save_double(key_mean, val.mean);
-    save_double(key_std,  val.std);
+//Fungsi gabungan save/load stat
+// prefix: "mic1", "mic2", "mic3"
+static void save_stat(const char *prefix, stat_t s)
+{
+    char key_mean[64], key_std[64];
+    snprintf(key_mean, sizeof(key_mean), "%s_mean", prefix);
+    snprintf(key_std,  sizeof(key_std),  "%s_std", prefix);
+    nvs_save_double(key_mean, s.mean);
+    nvs_save_double(key_std,  s.std);
+    nvs_commit(nvs_handle_app);
 }
 
-static void load_stat(const char *key_mean, const char *key_std, stat_t *val) {
-    val->mean = load_double(key_mean);
-    val->std  = load_double(key_std);
+static void load_stat(const char *prefix, stat_t *s)
+{
+    char key_mean[64], key_std[64];
+    snprintf(key_mean, sizeof(key_mean), "%s_mean", prefix);
+    snprintf(key_std,  sizeof(key_std),  "%s_std", prefix);
+    s->mean = nvs_load_double(key_mean);
+    s->std  = nvs_load_double(key_std);
 }
 
-static void save_threshold(threshold_t thr) {
-    save_double("thr_ste",  thr.ste_thr);
-    save_double("thr_peak", thr.peak_thr);
-    save_double("thr_zcr",  thr.zcr_thr);
+//Fungsi gabungan save/load threshold
+static void save_thr(const char *prefix, thr_t t)
+{
+    char key_ste[64], key_peak[64], key_zcr[64];
+    snprintf(key_ste,  sizeof(key_ste),  "%s_thr_ste", prefix);
+    snprintf(key_peak, sizeof(key_peak), "%s_thr_peak", prefix);
+    snprintf(key_zcr,  sizeof(key_zcr),  "%s_thr_zcr", prefix);
+
+    nvs_save_double(key_ste,  t.ste_thr);
+    nvs_save_double(key_peak, t.peak_thr);
+    nvs_save_double(key_zcr,  t.zcr_thr);
+    nvs_commit(nvs_handle_app);
 }
 
-static void load_threshold(threshold_t *thr) {
-    thr->ste_thr  = load_double("thr_ste");
-    thr->peak_thr = load_double("thr_peak");
-    thr->zcr_thr  = load_double("thr_zcr");
+static void load_thr(const char *prefix, thr_t *t)
+{
+    char key_ste[64], key_peak[64], key_zcr[64];
+    snprintf(key_ste,  sizeof(key_ste),  "%s_thr_ste", prefix);
+    snprintf(key_peak, sizeof(key_peak), "%s_thr_peak", prefix);
+    snprintf(key_zcr,  sizeof(key_zcr),  "%s_thr_zcr", prefix);
+
+    t->ste_thr  = nvs_load_double(key_ste);
+    t->peak_thr = nvs_load_double(key_peak);
+    t->zcr_thr  = nvs_load_double(key_zcr);
 }
 
-// ======= Mic1 Kalibrasi task =======
+// ==== ESPNOW RECV CALLBACK ====
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+
+    uint64_t now_since_start = esp_timer_get_time() - start_time_us;
+
+    if (len == sizeof(uint64_t)) {
+        // Paket sinkronisasi waktu
+        uint64_t ts_received;
+        memcpy(&ts_received, data, sizeof(ts_received));
+        if (now_since_start < 20000000ULL) {
+            ESP_LOGI(TAG, "[SYNC] Terima timestamp dari %s: %llu", macStr, (unsigned long long)ts_received);
+        }
+        return;
+    }
+
+    if (len == sizeof(mic3_data_t)) {
+        mic3_data_t pkt;
+        memcpy(&pkt, data, sizeof(pkt));
+
+        // Simpan sampel terbaru ke queue (overwrite agar tidak pernah penuh)
+        if (mic3_queue) {
+            // Queue length = 1 → boleh gunakan xQueueOverwrite
+            xQueueOverwrite(mic3_queue, &pkt);
+        }
+
+        // (Opsional) log singkat 20 detik pertama
+        if (now_since_start < 20000000ULL) {
+            ESP_LOGI(TAG, "[SYNC] Terima timestamp dari %s: %llu", macStr,(unsigned long long)pkt.timestamp);
+        }
+        return;
+    }
+
+    ESP_LOGW(TAG, "Paket tidak dikenali dari %s: len=%d", macStr, len);
+}
+
+// ==== ESPNOW INIT ====
+static void espnow_init(void)
+{
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+
+    esp_now_peer_info_t peerInfo = {0};
+    memcpy(peerInfo.peer_addr, slave_mac, 6);
+    peerInfo.channel = 1;   // samakan channel
+    peerInfo.encrypt = false;
+    ESP_ERROR_CHECK(esp_now_add_peer(&peerInfo));
+
+    ESP_LOGI(TAG, "Peer ESP2 didaftarkan");
+}
+
+// ======= Mic1 MODE / Kalibrasi task =======
 static void mic1_calib_task(void *arg)
 {
     ESP_LOGI(TAG, "mic1_calib_task started");
@@ -214,12 +346,19 @@ static void mic1_calib_task(void *arg)
 
     // Simpan statistik noise mic1
     double mean_ste, std_ste, mean_zcr, std_zcr, mean_peak, std_peak;
-    mean_std(m1_ste, N_EVENTS, &mean_ste, &std_ste);
-    mean_std(m1_zcr, N_EVENTS, &mean_zcr, &std_zcr);
-    mean_std(m1_peak, N_EVENTS, &mean_peak, &std_peak);
-    save_stat("m1_noise_ste", mean_ste, std_ste);
-    save_stat("m1_noise_zcr", mean_zcr, std_zcr);
-    save_stat("m1_noise_peak", mean_peak, std_peak);
+    compute_mean_std(m1_ste, N_EVENTS, &mean_ste, &std_ste);
+    compute_mean_std(m1_zcr, N_EVENTS, &mean_zcr, &std_zcr);
+    compute_mean_std(m1_peak, N_EVENTS, &mean_peak, &std_peak);
+    // save_stat("m1_noise_ste", mean_ste, std_ste);
+    // save_stat("m1_noise_zcr", mean_zcr, std_zcr);
+    // save_stat("m1_noise_peak", mean_peak, std_peak);
+    // Simpan statistik noise
+    stat_t noise_ste = {mean_ste, std_ste};
+    stat_t noise_zcr = {mean_zcr, std_zcr};
+    stat_t noise_peak = {mean_peak, std_peak};
+    save_stat("mic1_noise_ste", noise_ste);
+    save_stat("mic1_noise_zcr", noise_zcr);
+    save_stat("mic1_noise_peak", noise_peak);
     vTaskDelay(pdMS_TO_TICKS(5000)); //jeda 5 detik
 
     // Step 2: kalibrasi target mic1
@@ -238,19 +377,26 @@ static void mic1_calib_task(void *arg)
     ESP_LOGI(TAG, "mic1 target calib done");
 
     // Simpan statistik target mic1
-    mean_std(m1_ste, N_EVENTS, &mean_ste, &std_ste);
-    mean_std(m1_zcr, N_EVENTS, &mean_zcr, &std_zcr);
-    mean_std(m1_peak, N_EVENTS, &mean_peak, &std_peak);
-    save_stat("m1_target_ste", mean_ste, std_ste);
-    save_stat("m1_target_zcr", mean_zcr, std_zcr);
-    save_stat("m1_target_peak", mean_peak, std_peak);
+    compute_mean_std(m1_ste, N_EVENTS, &mean_ste, &std_ste);
+    compute_mean_std(m1_zcr, N_EVENTS, &mean_zcr, &std_zcr);
+    compute_mean_std(m1_peak, N_EVENTS, &mean_peak, &std_peak);
+    // save_stat("m1_target_ste", mean_ste, std_ste);
+    // save_stat("m1_target_zcr", mean_zcr, std_zcr);
+    // save_stat("m1_target_peak", mean_peak, std_peak);
+    // Simpan statistik target
+    stat_t target_ste = {mean_ste, std_ste};
+    stat_t target_zcr = {mean_zcr, std_zcr};
+    stat_t target_peak = {mean_peak, std_peak};
+    save_stat("mic1_target_ste", target_ste);
+    save_stat("mic1_target_zcr", target_zcr);
+    save_stat("mic1_target_peak", target_peak);
 
-   // Hitung threshold mic1 dan simpan dengan std deviasi
+   // Step : 3 Hitung threshold mic1 dan simpan dengan std deviasi
     thr_t thr1;
-    thr1.ste_thr  = mean_ste + 1.0 * std_ste;   // contoh margin 1 x std deviasi
+    thr1.ste_thr  = mean_ste + 1.0 * std_ste;
     thr1.peak_thr = mean_peak + 1.0 * std_peak;
     thr1.zcr_thr  = fmax(0.0, mean_zcr - 0.5 * std_zcr);
-    save_thr("m1", thr1);
+    save_thr("mic1", thr1);
     ESP_LOGI(TAG, "MIC1 thresholds: STE=%.2f, PEAK=%.2f, ZCR=%.2f", thr1.ste_thr, thr1.peak_thr, thr1.zcr_thr);
 
     ESP_LOGI(TAG, "mic1 threshold saved");
@@ -262,7 +408,7 @@ static void mic1_calib_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ======= Mic2 Kalibrasi task =======
+// ======= Mic2 MODE / Kalibrasi task =======
 static void mic2_calib_task(void *arg)
 {
     ESP_LOGI(TAG, "mic2_calib_task waiting mic1");
@@ -298,12 +444,19 @@ static void mic2_calib_task(void *arg)
 
     // Simpan statistik noise mic2
     double mean_ste, std_ste, mean_zcr, std_zcr, mean_peak, std_peak;
-    mean_std(m2_ste, N_EVENTS, &mean_ste, &std_ste);
-    mean_std(m2_zcr, N_EVENTS, &mean_zcr, &std_zcr);
-    mean_std(m2_peak, N_EVENTS, &mean_peak, &std_peak);
-    save_stat("m2_noise_ste", mean_ste, std_ste);
-    save_stat("m2_noise_zcr", mean_zcr, std_zcr);
-    save_stat("m2_noise_peak", mean_peak, std_peak);
+    compute_mean_std(m2_ste, N_EVENTS, &mean_ste, &std_ste);
+    compute_mean_std(m2_zcr, N_EVENTS, &mean_zcr, &std_zcr);
+    compute_mean_std(m2_peak, N_EVENTS, &mean_peak, &std_peak);
+    // save_stat("m2_noise_ste", mean_ste, std_ste);
+    // save_stat("m2_noise_zcr", mean_zcr, std_zcr);
+    // save_stat("m2_noise_peak", mean_peak, std_peak);
+    // Simpan statistik noise
+    stat_t noise_ste = {mean_ste, std_ste};
+    stat_t noise_zcr = {mean_zcr, std_zcr};
+    stat_t noise_peak = {mean_peak, std_peak};
+    save_stat("mic2_noise_ste", noise_ste);
+    save_stat("mic2_noise_zcr", noise_zcr);
+    save_stat("mic2_noise_peak", noise_peak);
     vTaskDelay(pdMS_TO_TICKS(5000));// jeda 5 detik
 
     // Step 2: kalibrasi target mic2
@@ -322,14 +475,21 @@ static void mic2_calib_task(void *arg)
     ESP_LOGI(TAG, "mic2 target calib done");
 
     // Simpan statistik target mic2
-    mean_std(m2_ste, N_EVENTS, &mean_ste, &std_ste);
-    mean_std(m2_zcr, N_EVENTS, &mean_zcr, &std_zcr);
-    mean_std(m2_peak, N_EVENTS, &mean_peak, &std_peak);
-    save_stat("m2_target_ste", mean_ste, std_ste);
-    save_stat("m2_target_zcr", mean_zcr, std_zcr);
-    save_stat("m2_target_peak", mean_peak, std_peak);
+    compute_mean_std(m2_ste, N_EVENTS, &mean_ste, &std_ste);
+    compute_mean_std(m2_zcr, N_EVENTS, &mean_zcr, &std_zcr);
+    compute_mean_std(m2_peak, N_EVENTS, &mean_peak, &std_peak);
+    // save_stat("m2_target_ste", mean_ste, std_ste);
+    // save_stat("m2_target_zcr", mean_zcr, std_zcr);
+    // save_stat("m2_target_peak", mean_peak, std_peak);
+    // Simpan statistik target
+    stat_t target_ste = {mean_ste, std_ste};
+    stat_t target_zcr = {mean_zcr, std_zcr};
+    stat_t target_peak = {mean_peak, std_peak};
+    save_stat("mic2_target_ste", target_ste);
+    save_stat("mic2_target_zcr", target_zcr);
+    save_stat("mic2_target_peak", target_peak);
 
-    // Hitung threshold mic2 dan simpan dengan std deviasi
+    // Step 3 : Hitung threshold mic2 dan simpan dengan std deviasi
     thr_t thr2;
     thr2.ste_thr  = mean_ste + 1.0 * std_ste;
     thr2.peak_thr = mean_peak + 1.0 * std_peak;
@@ -344,6 +504,125 @@ static void mic2_calib_task(void *arg)
     xEventGroupSetBits(eg, EVT_MIC2_CALIB_DONE);
 
     vTaskDelete(NULL);
+}
+
+// ==== MIC3 MODE TASK (kalibrasi/deteksi mic3 di ESP1) ====
+static void mode_task(void *arg)
+{
+    float ste_list[N_EVENTS], zcr_list[N_EVENTS], peak_list[N_EVENTS];
+    int collected = 0;
+    thr_t thr;
+    stat_t noise_ste, noise_peak, noise_zcr;
+    stat_t target_ste, target_peak, target_zcr;
+
+    // Pastikan kita punya queue
+    configASSERT(mic3_queue != NULL);
+
+    while (1) {
+        mic3_data_t sample;
+
+        // Tunggu sampel mic3 dari ESP2
+        if (xQueueReceive(mic3_queue, &sample, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        float ste  = sample.ste;
+        float zcr  = sample.zcr;
+        int   peak = sample.peak;
+
+        if (current_mode == MODE_CAL_NOISE || current_mode == MODE_CAL_TARGET) {
+            if (collected < N_EVENTS) {
+                ste_list[collected]  = ste;
+                zcr_list[collected]  = zcr;
+                peak_list[collected] = (float)peak;
+                collected++;
+
+                ESP_LOGI(TAG, "CAL[%s] %d/%d t_ESP2=%llu  STE=%.2f  ZCR=%.4f  PEAK=%d",
+                         (current_mode == MODE_CAL_NOISE ? "NOISE" : "TARGET"),
+                         collected, N_EVENTS, (unsigned long long)sample.timestamp, ste, zcr, peak);
+            } else {
+                stat_t s_ste, s_peak, s_zcr;
+                compute_mean_std(ste_list,  N_EVENTS, &s_ste.mean,  &s_ste.std);
+                compute_mean_std(peak_list, N_EVENTS, &s_peak.mean, &s_peak.std);
+                compute_mean_std(zcr_list,  N_EVENTS, &s_zcr.mean,  &s_zcr.std);
+
+                // ✅ Debug print sebelum disimpan
+                ESP_LOGI(TAG, "DEBUG: s_ste.mean=%.2f s_peak.mean=%.2f s_zcr.mean=%.4f", s_ste.mean, s_peak.mean, s_zcr.mean);
+
+                if (current_mode == MODE_CAL_NOISE) {
+                    // save_stat("noise_ste_m",  "noise_ste_s",  s_ste);
+                    // save_stat("noise_peak_m", "noise_peak_s", s_peak);
+                    // save_stat("noise_zcr_m",  "noise_zcr_s",  s_zcr);
+                    save_stat("mic3_noise_ste", s_ste);
+                    save_stat("mic3_noise_peak", s_peak);
+                    save_stat("mic3_noise_zcr", s_zcr);
+                    ESP_LOGI(TAG, "Noise stats saved");
+                } else { // MODE_CAL_TARGET
+                    // save_stat("target_ste_m",  "target_ste_s",  s_ste);
+                    // save_stat("target_peak_m", "target_peak_s", s_peak);
+                    // save_stat("target_zcr_m",  "target_zcr_s",  s_zcr);
+                    save_stat("mic3_target_ste", s_ste);
+                    save_stat("mic3_target_peak", s_peak);
+                    save_stat("mic3_target_zcr", s_zcr);
+                    ESP_LOGI(TAG, "Target stats saved");
+                }
+
+                collected = 0;
+                vTaskDelay(pdMS_TO_TICKS(MODE_DELAY_MS));
+                current_mode++;
+                ESP_LOGI(TAG, "Switched mode -> %d", current_mode);
+            }
+        }
+        else if (current_mode == MODE_CAL_RESULT) {
+            // load_stat("noise_ste_m",  "noise_ste_s",  &noise_ste);
+            // load_stat("noise_peak_m", "noise_peak_s", &noise_peak);
+            // load_stat("noise_zcr_m",  "noise_zcr_s",  &noise_zcr);
+            // load_stat("target_ste_m",  "target_ste_s",  &target_ste);
+            // load_stat("target_peak_m", "target_peak_s", &target_peak);
+            // load_stat("target_zcr_m",  "target_zcr_s",  &target_zcr);
+            ESP_LOGI(TAG, "DEBUG: about to load mic3_target_ste");
+            // beri waktu NVS commit stabil
+            vTaskDelay(pdMS_TO_TICKS(500)); // 50–100 ms biasanya cukup
+
+            load_stat("mic3_noise_ste",  &noise_ste);
+            load_stat("mic3_noise_peak", &noise_peak);
+            load_stat("mic3_noise_zcr",  &noise_zcr);
+
+            load_stat("mic3_target_ste",  &target_ste);
+            load_stat("mic3_target_peak", &target_peak);
+            load_stat("mic3_target_zcr",  &target_zcr);
+
+            // ✅ Debug print setelah load
+                ESP_LOGI(TAG, "DEBUG loaded noise_ste.mean=%.2f, noise_peak.mean=%.2f, noise_zcr.mean=%.4f", 
+                        noise_ste.mean, noise_peak.mean, noise_zcr.mean);
+                ESP_LOGI(TAG, "DEBUG loaded target_ste.mean=%.2f, target_peak.mean=%.2f, target_zcr.mean=%.4f", 
+                        target_ste.mean, target_peak.mean, target_zcr.mean);
+
+            thr.ste_thr  = noise_ste.mean  + 0.5 * (target_ste.mean  - noise_ste.mean);
+            thr.peak_thr = noise_peak.mean + 0.5 * (target_peak.mean - noise_peak.mean);
+            thr.zcr_thr  = fmax(0.0, noise_zcr.mean - 0.5 * noise_zcr.std);
+
+            // save_threshold(thr);
+            save_thr("mic3", thr);
+            ESP_LOGI(TAG, "t_ESP2=%llu | Threshold saved: STE=%.2f  PEAK=%.2f  ZCR=%.4f",
+                     (unsigned long long)sample.timestamp, thr.ste_thr, thr.peak_thr, thr.zcr_thr);
+
+            vTaskDelay(pdMS_TO_TICKS(MODE_DELAY_MS));
+            current_mode = MODE_DETECTION;
+            ESP_LOGI(TAG, "Switched mode -> MODE_DETECTION");
+            // ✅ Kalibrasi Mic3 selesai, set flag
+            calib_done = true;
+        }
+        // ini akan dimasukan ke task yang sama dengan mic1 dan mic2
+        else if (current_mode == MODE_DETECTION) {
+            // load_threshold(&thr);
+            // if ((peak > thr.peak_thr) && (ste > thr.ste_thr) && (zcr < thr.zcr_thr)) {
+            //     ESP_LOGI(TAG, "t_ESP2=%llu | Event DETECTED: STE=%.2f  PEAK=%d  ZCR=%.4f", (unsigned long long)sample.timestamp, ste, peak, zcr);
+            // }
+            xQueueOverwrite(mic3_queue, &sample);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
 }
 
 // ======= Mic1 Reader Task =======
@@ -414,19 +693,21 @@ static void detection_task(void *arg)
     xEventGroupWaitBits(eg, EVT_MIC1_CALIB_DONE | EVT_MIC2_CALIB_DONE, pdFALSE, pdTRUE, portMAX_DELAY);
     ESP_LOGI(TAG, "Detection task started");
 
-    thr_t thr1, thr2;
+    thr_t thr1, thr2, thr3;
 
     // Baca threshold kalibrasi sekali saja di awal
     load_thr("m1", &thr1);
     load_thr("m2", &thr2);
+    load_thr("m3", &thr3);
 
     while (1) {
-        feat_t f1, f2;
+        feat_t f1, f2, f3;
 
         // Ambil data fitur dengan proteksi semaphore
         if (xSemaphoreTake(feat_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             f1 = last_m1;
             f2 = last_m2;
+            f3 = last_m3;
             xSemaphoreGive(feat_mutex);
         } else {
             ESP_LOGW(TAG, "Failed to take feat_mutex");
@@ -437,22 +718,31 @@ static void detection_task(void *arg)
         // Deteksi jika melewati threshold
         bool d1 = (f1.peak > thr1.peak_thr) && (f1.ste > thr1.ste_thr) && (f1.zcr < thr1.zcr_thr);
         bool d2 = (f2.peak > thr2.peak_thr) && (f2.ste > thr2.ste_thr) && (f2.zcr < thr2.zcr_thr);
+        bool d3 = (f3.peak > thr3.peak_thr) && (f3.ste > thr3.ste_thr) && (f3.zcr < thr3.zcr_thr);
 
         if (d1 || d2) {
             // Hitung waktu kedatangan suara (TOA) relatif
             uint64_t idx_off1 = ((uint64_t)f1.idx * 1000000ULL) / SAMPLE_RATE;
             uint64_t idx_off2 = ((uint64_t)f2.idx * 1000000ULL) / SAMPLE_RATE;
+            uint64_t idx_off3 = ((uint64_t)f3.idx * 1000000ULL) / SAMPLE_RATE;
 
             uint64_t toa1 = (f1.ts_us >= idx_off1) ? (f1.ts_us - idx_off1) : f1.ts_us;
             uint64_t toa2 = (f2.ts_us >= idx_off2) ? (f2.ts_us - idx_off2) : f2.ts_us;
+            uint64_t toa3 = (f3.ts_us >= idx_off3) ? (f3.ts_us - idx_off3) : f3.ts_us;
 
-            if (d1 && (!d2 || toa1 <= toa2)) {
+           // Tentukan siapa yang pertama
+            if (d1 && (!d2 || toa1 <= toa2) && (!d3 || toa1 <= toa3)) {
                 ESP_LOGI(TAG, "[DETECT] Mic1 FIRST | TOA=%llu us | STE=%.2f PEAK=%d ZCR=%.4f",
-                         toa1, f1.ste, f1.peak, f1.zcr);
-            } else if (d2 && (!d1 || toa2 < toa1)) {
+                        toa1, f1.ste, f1.peak, f1.zcr);
+            } else if (d2 && (!d1 || toa2 < toa1) && (!d3 || toa2 <= toa3)) {
                 ESP_LOGI(TAG, "[DETECT] Mic2 FIRST | TOA=%llu us | STE=%.2f PEAK=%d ZCR=%.4f",
-                         toa2, f2.ste, f2.peak, f2.zcr);
-            } else{ESP_LOGI(TAG, "TIDAK TERDETEKSI");}
+                        toa2, f2.ste, f2.peak, f2.zcr);
+            } else if (d3 && (!d1 || toa3 < toa1) && (!d2 || toa3 < toa2)) {
+                ESP_LOGI(TAG, "[DETECT] Mic3 FIRST | TOA=%llu us | STE=%.2f PEAK=%d ZCR=%.4f",
+                        toa3, f3.ste, f3.peak, f3.zcr);
+            } else {
+                ESP_LOGI(TAG, "TIDAK TERDETEKSI");
+            }
 
             // Delay lebih panjang sebagai debounce supaya tidak double detect
             vTaskDelay(pdMS_TO_TICKS(300));
@@ -463,174 +753,34 @@ static void detection_task(void *arg)
     }
 }
 
-// ==== ESPNOW RECV CALLBACK ====
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
-{
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
-             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-
-    uint64_t now_since_start = esp_timer_get_time() - start_time_us;
-
-    if (len == sizeof(uint64_t)) {
-        // Paket sinkronisasi waktu
-        uint64_t ts_received;
-        memcpy(&ts_received, data, sizeof(ts_received));
-        if (now_since_start < 20000000ULL) {
-            ESP_LOGI(TAG, "[SYNC] Terima timestamp dari %s: %llu", macStr, (unsigned long long)ts_received);
-        }
-        return;
-    }
-
-    if (len == sizeof(mic3_data_t)) {
-        mic3_data_t pkt;
-        memcpy(&pkt, data, sizeof(pkt));
-
-        // Simpan sampel terbaru ke queue (overwrite agar tidak pernah penuh)
-        if (mic3_queue) {
-            // Queue length = 1 → boleh gunakan xQueueOverwrite
-            xQueueOverwrite(mic3_queue, &pkt);
-        }
-
-        // (Opsional) log singkat 20 detik pertama
-        if (now_since_start < 20000000ULL) {
-            ESP_LOGI(TAG, "[SYNC] Terima timestamp dari %s: %llu", macStr,(unsigned long long)pkt.timestamp);
-        }
-        return;
-    }
-
-    ESP_LOGW(TAG, "Paket tidak dikenali dari %s: len=%d", macStr, len);
-}
-
-// ==== ESPNOW INIT ====
-static void espnow_init(void)
-{
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
-
-    esp_now_peer_info_t peerInfo = {0};
-    memcpy(peerInfo.peer_addr, slave_mac, 6);
-    peerInfo.channel = 1;   // samakan channel
-    peerInfo.encrypt = false;
-    ESP_ERROR_CHECK(esp_now_add_peer(&peerInfo));
-
-    ESP_LOGI(TAG, "Peer ESP2 didaftarkan");
-}
-
-// ==== MODE TASK (kalibrasi/deteksi mic3 di ESP1) ====
-static void mode_task(void *arg)
-{
-    float ste_list[N_EVENTS], zcr_list[N_EVENTS], peak_list[N_EVENTS];
-    int collected = 0;
-    threshold_t thr;
-    stat_t noise_ste, noise_peak, noise_zcr;
-    stat_t target_ste, target_peak, target_zcr;
-
-    // Pastikan kita punya queue
-    configASSERT(mic3_queue != NULL);
-
-    while (1) {
-        mic3_data_t sample;
-
-        // Tunggu sampel mic3 dari ESP2
-        if (xQueueReceive(mic3_queue, &sample, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        float ste  = sample.ste;
-        float zcr  = sample.zcr;
-        int   peak = sample.peak;
-
-        if (current_mode == MODE_CAL_NOISE || current_mode == MODE_CAL_TARGET) {
-            if (collected < N_EVENTS) {
-                ste_list[collected]  = ste;
-                zcr_list[collected]  = zcr;
-                peak_list[collected] = (float)peak;
-                collected++;
-
-                ESP_LOGI(TAG, "CAL[%s] %d/%d t_ESP2=%llu  STE=%.2f  ZCR=%.4f  PEAK=%d",
-                         (current_mode == MODE_CAL_NOISE ? "NOISE" : "TARGET"),
-                         collected, N_EVENTS, (unsigned long long)sample.timestamp, ste, zcr, peak);
-            } else {
-                stat_t s_ste, s_peak, s_zcr;
-                compute_mean_std(ste_list,  N_EVENTS, &s_ste.mean,  &s_ste.std);
-                compute_mean_std(peak_list, N_EVENTS, &s_peak.mean, &s_peak.std);
-                compute_mean_std(zcr_list,  N_EVENTS, &s_zcr.mean,  &s_zcr.std);
-
-                if (current_mode == MODE_CAL_NOISE) {
-                    save_stat("noise_ste_m",  "noise_ste_s",  s_ste);
-                    save_stat("noise_peak_m", "noise_peak_s", s_peak);
-                    save_stat("noise_zcr_m",  "noise_zcr_s",  s_zcr);
-                    ESP_LOGI(TAG, "Noise stats saved");
-                } else { // MODE_CAL_TARGET
-                    save_stat("target_ste_m",  "target_ste_s",  s_ste);
-                    save_stat("target_peak_m", "target_peak_s", s_peak);
-                    save_stat("target_zcr_m",  "target_zcr_s",  s_zcr);
-                    ESP_LOGI(TAG, "Target stats saved");
-                }
-
-                collected = 0;
-                vTaskDelay(pdMS_TO_TICKS(MODE_DELAY_MS));
-                current_mode++;
-                ESP_LOGI(TAG, "Switched mode -> %d", current_mode);
-            }
-        }
-        else if (current_mode == MODE_CAL_RESULT) {
-            load_stat("noise_ste_m",  "noise_ste_s",  &noise_ste);
-            load_stat("noise_peak_m", "noise_peak_s", &noise_peak);
-            load_stat("noise_zcr_m",  "noise_zcr_s",  &noise_zcr);
-            load_stat("target_ste_m",  "target_ste_s",  &target_ste);
-            load_stat("target_peak_m", "target_peak_s", &target_peak);
-            load_stat("target_zcr_m",  "target_zcr_s",  &target_zcr);
-
-            thr.ste_thr  = noise_ste.mean  + 0.5 * (target_ste.mean  - noise_ste.mean);
-            thr.peak_thr = noise_peak.mean + 0.5 * (target_peak.mean - noise_peak.mean);
-            thr.zcr_thr  = fmax(0.0, noise_zcr.mean - 0.5 * noise_zcr.std);
-
-            save_threshold(thr);
-            ESP_LOGI(TAG, "t_ESP2=%llu | Threshold saved: STE=%.2f  PEAK=%.2f  ZCR=%.4f",
-                     (unsigned long long)sample.timestamp, thr.ste_thr, thr.peak_thr, thr.zcr_thr);
-
-            vTaskDelay(pdMS_TO_TICKS(MODE_DELAY_MS));
-            current_mode = MODE_DETECTION;
-            ESP_LOGI(TAG, "Switched mode -> MODE_DETECTION");
-        }
-        else if (current_mode == MODE_DETECTION) {
-            load_threshold(&thr);
-            if ((peak > thr.peak_thr) && (ste > thr.ste_thr) && (zcr < thr.zcr_thr)) {
-                ESP_LOGI(TAG, "t_ESP2=%llu | Event DETECTED: STE=%.2f  PEAK=%d  ZCR=%.4f", (unsigned long long)sample.timestamp, ste, peak, zcr);
-            }
-        }
-    }
-}
-
 // ==== APP MAIN ====
 void app_main(void)
 {
     ESP_LOGI(TAG, "Mulai ESP1 MASTER");
 
-    // NVS init (harus sebelum nvs_open)
+    // 1️⃣ Inisialisasi NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
-    ESP_ERROR_CHECK(nvs_open("storage", NVS_READWRITE, &nvs_handle_app));
+    ESP_ERROR_CHECK(nvs_open("calib", NVS_READWRITE, &nvs_handle_app));
 
-    // WiFi + ESPNOW
+    // 2️⃣ Inisialisasi EventGroup & Mutex
+    eg = xEventGroupCreate();
+    feat_mutex = xSemaphoreCreateMutex();
+
+    // 3️⃣ Inisialisasi WiFi & ESPNOW
     wifi_init();
-    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE)); // samakan channel dengan ESP2
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
     espnow_init();
 
-    // Queue untuk sampel mic3 (1 slot → overwrite newest)
+    // 4️⃣ Inisialisasi Queue mic3
     mic3_queue = xQueueCreate(1, sizeof(mic3_data_t));
     configASSERT(mic3_queue != NULL);
 
-    // Mulai waktu start
+    // 5️⃣ Sinkronisasi dengan ESP2 (mic3)
     start_time_us = esp_timer_get_time();
-
-    // Kirim request sinkronisasi ke ESP2
     const char *sync_req = "SYNC_START";
     esp_err_t send_result = esp_now_send(slave_mac, (uint8_t *)sync_req, strlen(sync_req));
     if (send_result == ESP_OK) {
@@ -639,13 +789,41 @@ void app_main(void)
         ESP_LOGW(TAG, "Gagal kirim SYNC request (%d)", send_result);
     }
 
-    // Setelah 20 detik, baru start mode_task
+    // Tunggu 20 detik sampai ESP2 siap
     vTaskDelay(pdMS_TO_TICKS(20000));
-    ESP_LOGI(TAG, "Sinkronisasi selesai, mulai MODE1 (CAL_NOISE)");
+    ESP_LOGI(TAG, "Sinkronisasi selesai, ESP2 siap");
+
+    // 6️⃣ Mulai kalibrasi mic1
+    xTaskCreate(mic1_calib_task, "mic1_calib", 8192, NULL, 6, NULL);
+    xEventGroupWaitBits(eg, EVT_MIC1_CALIB_DONE, pdFALSE, pdTRUE, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // 7️⃣ Mulai kalibrasi mic2
+    xTaskCreate(mic2_calib_task, "mic2_calib", 8192, NULL, 6, NULL);
+    xEventGroupWaitBits(eg, EVT_MIC2_CALIB_DONE, pdFALSE, pdTRUE, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // 9️⃣ Mulai mode_task untuk mic3 (kalibrasi & mode deteksi)
+    // Mode_task menunggu mic1 & mic2 kalibrasi sebelum hitung threshold gabungan
+    ESP_LOGI(TAG, "Mulai mode_task mic3");
     xTaskCreatePinnedToCore(mode_task, "mode_task", 12288, NULL, 6, NULL, 1);
 
-    // Idle
+    // 8️⃣ Mulai reader mic1 & mic2
+    xTaskCreate(mic1_reader_task, "mic1_reader", 4096, NULL, 5, NULL);
+    xTaskCreate(mic2_reader_task, "mic2_reader", 4096, NULL, 5, NULL);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Tunggu sampai kalibrasi selesai
+    while(!calib_done) {
+        vTaskDelay(pdMS_TO_TICKS(10)); // tunggu 10 ms
+    }
+
+    // 🔟 Mulai task deteksi gabungan (mic1, mic2, mic3)
+    xTaskCreate(detection_task, "detection", 8192, NULL, 7, NULL);
+
+    // 11️⃣ Idle loop
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
